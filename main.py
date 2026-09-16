@@ -1,9 +1,10 @@
-import os
 import io
 import json
-import time
 import logging
+import os
+import time
 from pathlib import Path
+from typing import Any
 
 import requests
 from PIL import Image
@@ -12,237 +13,350 @@ from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# НАСТРОЙКИ
 # ============================================================
 
+# -------------------------
+# VK
+# -------------------------
+
+VK_API_VERSION = "5.131"
+VK_GROUP_ID = os.getenv("VK_GROUP_ID")
+VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
+
+
+# -------------------------
+# YANDEX DISK
+# -------------------------
+
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
+
 YANDEX_FOLDER = os.getenv(
     "YANDEX_FOLDER",
     "disk:/Нейрофото"
 )
 
+
+# -------------------------
+# GEMINI
+# -------------------------
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID"
-)
-
-# 2 часа
-INTERVAL_SECONDS = 2 * 60 * 60
-
-# Gemini
 GEMINI_MODEL = "gemini-3.6-flash"
 
-# HTTP
-HTTP_TIMEOUT = 120
 
-# Максимальное число попыток Gemini
-GEMINI_RETRIES = 3
+# -------------------------
+# TELEGRAM
+# -------------------------
 
-# Паузы
-RETRY_DELAYS = [5, 15, 30]
-
-# Разрешённые изображения
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp"
-}
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ============================================================
-# CHECK CONFIG
-# ============================================================
+# -------------------------
+# ПРОЧИЕ НАСТРОЙКИ
+# -------------------------
 
-required_settings = {
-    "YANDEX_TOKEN": YANDEX_TOKEN,
-    "YANDEX_FOLDER": YANDEX_FOLDER,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-}
+CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
 
-missing_settings = [
-    name
-    for name, value in required_settings.items()
-    if not value
-]
+YANDEX_API = "https://cloud-api.yandex.net/v1/disk"
 
-if missing_settings:
-    raise RuntimeError(
-        "Не заданы переменные окружения:\n"
-        + "\n".join(
-            f"- {item}"
-            for item in missing_settings
-        )
-    )
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+)
 
 
 # ============================================================
-# LOGGING
+# ЛОГИ
 # ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# ПРОВЕРКА ПЕРЕМЕННЫХ
+# ============================================================
+
+def check_env():
+
+    required = {
+        "YANDEX_TOKEN": YANDEX_TOKEN,
+        "YANDEX_FOLDER": YANDEX_FOLDER,
+        "GEMINI_API_KEY": GEMINI_API_KEY,
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+        "VK_ACCESS_TOKEN": VK_ACCESS_TOKEN,
+        "VK_GROUP_ID": VK_GROUP_ID,
+    }
+
+    missing = [
+        name
+        for name, value in required.items()
+        if not value
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Не заданы переменные окружения: "
+            + ", ".join(missing)
+        )
+
+    logger.info("Все необходимые переменные окружения найдены.")
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def telegram_send(text: str):
+
+    url = f"{TELEGRAM_API}/sendMessage"
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
     )
-)
 
-logger = logging.getLogger(
-    "yandex-gemini-worker"
-)
+    # В случае ошибки Telegram выводим его настоящий ответ
+    # в лог, чтобы было понятно, что именно произошло.
+    if not response.ok:
+        logger.error(
+            "Telegram error: HTTP %s | %s",
+            response.status_code,
+            response.text,
+        )
+
+    response.raise_for_status()
 
 
 # ============================================================
-# GEMINI
+# VK — ТЕСТ АВТОРИЗАЦИИ
 # ============================================================
 
-gemini = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+def test_vk():
+
+    logger.info("")
+    logger.info("======================================")
+    logger.info("          VK AUTH TEST")
+    logger.info("======================================")
+
+    if not VK_ACCESS_TOKEN:
+        logger.error("VK_ACCESS_TOKEN не задан.")
+        return False
+
+    if not VK_GROUP_ID:
+        logger.error("VK_GROUP_ID не задан.")
+        return False
+
+    logger.info("VK_GROUP_ID: %s", VK_GROUP_ID)
+    logger.info("VK API VERSION: %s", VK_API_VERSION)
+    logger.info("Проверяем доступ к VK...")
+
+    url = "https://api.vk.com/method/groups.getById"
+
+    params = {
+        "group_id": VK_GROUP_ID,
+        "access_token": VK_ACCESS_TOKEN,
+        "v": VK_API_VERSION,
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=30,
+        )
+
+        logger.info(
+            "VK HTTP STATUS: %s",
+            response.status_code,
+        )
+
+        logger.info(
+            "VK RESPONSE: %s",
+            response.text,
+        )
+
+        if not response.ok:
+            logger.error(
+                "VK вернул HTTP ошибку."
+            )
+            return False
+
+        data = response.json()
+
+        # VK API вернул ошибку
+        if "error" in data:
+
+            error = data["error"]
+
+            logger.error(
+                "VK ERROR CODE: %s",
+                error.get("error_code"),
+            )
+
+            logger.error(
+                "VK ERROR MESSAGE: %s",
+                error.get("error_msg"),
+            )
+
+            logger.error(
+                "Полная ошибка VK: %s",
+                error,
+            )
+
+            logger.info(
+                "======================================"
+            )
+
+            return False
+
+        # Успешный ответ
+        if "response" in data:
+
+            logger.info(
+                "VK AUTH OK"
+            )
+
+            logger.info(
+                "Доступ к группе получен."
+            )
+
+            logger.info(
+                "VK RESPONSE DATA: %s",
+                data["response"],
+            )
+
+            logger.info(
+                "======================================"
+            )
+
+            return True
+
+        logger.warning(
+            "VK вернул неожиданный ответ: %s",
+            data,
+        )
+
+        logger.info(
+            "======================================"
+        )
+
+        return False
+
+    except Exception as e:
+
+        logger.exception(
+            "Ошибка при проверке VK: %s",
+            e,
+        )
+
+        logger.info(
+            "======================================"
+        )
+
+        return False
 
 
 # ============================================================
 # YANDEX DISK
 # ============================================================
 
-YANDEX_API = (
-    "https://cloud-api.yandex.net/v1/disk"
-)
-
-
 def yandex_headers():
 
     return {
-        "Authorization": (
-            f"OAuth {YANDEX_TOKEN}"
-        )
+        "Authorization": f"OAuth {YANDEX_TOKEN}"
     }
 
 
-def yandex_get_folder():
+def get_yandex_files():
 
-    url = (
-        f"{YANDEX_API}/resources"
-    )
-
-    params = {
-        "path": YANDEX_FOLDER,
-        "limit": 100,
-        "sort": "path"
-    }
+    url = f"{YANDEX_API}/resources"
 
     response = requests.get(
         url,
         headers=yandex_headers(),
-        params=params,
-        timeout=HTTP_TIMEOUT
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def get_first_image():
-
-    data = yandex_get_folder()
-
-    embedded = data.get(
-        "_embedded",
-        {}
-    )
-
-    items = embedded.get(
-        "items",
-        []
-    )
-
-    images = []
-
-    for item in items:
-
-        if item.get(
-            "type"
-        ) != "file":
-            continue
-
-        path = item.get(
-            "path"
-        )
-
-        if not path:
-            continue
-
-        extension = (
-            Path(path)
-            .suffix
-            .lower()
-        )
-
-        if extension not in IMAGE_EXTENSIONS:
-            continue
-
-        images.append(item)
-
-    if not images:
-        return None
-
-    # Сортируем по имени/пути,
-    # чтобы обработка была предсказуемой
-    images.sort(
-        key=lambda item: item.get(
-            "path",
-            ""
-        )
-    )
-
-    return images[0]
-
-
-def yandex_download_file(path):
-
-    url = (
-        f"{YANDEX_API}/resources/download"
-    )
-
-    params = {
-        "path": path
-    }
-
-    response = requests.get(
-        url,
-        headers=yandex_headers(),
-        params=params,
-        timeout=HTTP_TIMEOUT
+        params={
+            "path": YANDEX_FOLDER,
+            "limit": 100,
+            "sort": "name",
+        },
+        timeout=30,
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    href = data.get(
-        "href"
+    return data.get(
+        "_embedded",
+        {}
+    ).get(
+        "items",
+        []
     )
 
-    if not href:
-        raise RuntimeError(
-            "Яндекс.Диск не вернул ссылку "
-            "на скачивание."
-        )
+
+def select_image(files):
+
+    image_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".bmp",
+        ".heic",
+    }
+
+    for item in files:
+
+        if item.get("type") != "file":
+            continue
+
+        name = item.get("name", "")
+
+        extension = Path(
+            name
+        ).suffix.lower()
+
+        if extension in image_extensions:
+            return item
+
+    return None
+
+
+def download_yandex_file(path: str) -> bytes:
+
+    response = requests.get(
+        f"{YANDEX_API}/resources/download",
+        headers=yandex_headers(),
+        params={
+            "path": path
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    download_url = data["href"]
 
     file_response = requests.get(
-        href,
-        timeout=HTTP_TIMEOUT,
-        allow_redirects=True
+        download_url,
+        timeout=120,
     )
 
     file_response.raise_for_status()
@@ -250,513 +364,451 @@ def yandex_download_file(path):
     return file_response.content
 
 
-def yandex_delete_file(path):
-
-    url = (
-        f"{YANDEX_API}/resources"
-    )
-
-    params = {
-        "path": path,
-        "permanently": "true"
-    }
+def delete_yandex_file(path: str):
 
     response = requests.delete(
-        url,
+        f"{YANDEX_API}/resources",
         headers=yandex_headers(),
-        params=params,
-        timeout=HTTP_TIMEOUT
+        params={
+            "path": path,
+            "permanently": "true",
+        },
+        timeout=30,
     )
 
     response.raise_for_status()
-
-    logger.info(
-        "Файл удалён с Яндекс.Диска: %s",
-        path
-    )
 
 
 # ============================================================
 # IMAGE
 # ============================================================
 
-def normalize_image(image_bytes):
+def normalize_image(file_bytes: bytes) -> bytes:
 
     image = Image.open(
-        io.BytesIO(image_bytes)
+        io.BytesIO(file_bytes)
     )
 
-    logger.info(
-        "Исходное изображение: "
-        "%s %s",
-        image.format,
-        image.size
-    )
+    if image.mode not in (
+        "RGB",
+        "RGBA",
+    ):
+        image = image.convert("RGB")
 
-    rgb = image.convert(
-        "RGB"
-    )
+    output = io.BytesIO()
 
-    buffer = io.BytesIO()
-
-    rgb.save(
-        buffer,
+    image.save(
+        output,
         format="JPEG",
-        quality=95
+        quality=95,
     )
 
-    return buffer.getvalue()
+    return output.getvalue()
 
 
 # ============================================================
-# GEMINI ANALYSIS
+# GEMINI
 # ============================================================
 
-ANALYSIS_PROMPT = """
-Ты — профессиональный аналитик изображений
-и prompt engineer.
+def analyze_image(
+    image_bytes: bytes
+) -> dict[str, Any]:
 
-Проанализируй прикреплённое изображение максимально подробно.
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
-Главная задача:
-описать именно то, что находится на фотографии,
-чтобы другой генератор изображения мог
-максимально точно воспроизвести сцену.
+    prompt = """
+Ты профессиональный аналитик изображений
+и специалист по созданию фотореалистичных
+промптов для генерации изображений.
 
-Не придумывай элементов,
-которых нет на изображении.
+Внимательно проанализируй предоставленную фотографию.
 
-Особенно подробно проанализируй:
+Определи:
 
-- сюжет;
-- главный объект;
-- количество людей;
-- положение человека в кадре;
-- кадрирование;
-- ракурс;
-- перспективу;
-- позу;
-- положение головы;
-- направление взгляда;
-- руки и пальцы;
-- ноги;
-- волосы;
+1. Кто изображён на фотографии.
+2. Пол и примерный возраст.
+3. Внешность человека.
+4. Форму лица.
+5. Волосы и причёску.
+6. Цвет глаз.
+7. Одежду.
+8. Аксессуары.
+9. Положение тела.
+10. Положение головы.
+11. Выражение лица.
+12. Направление взгляда.
+13. Положение рук.
+14. Окружение.
+15. Фон.
+16. Передний и задний план.
+17. Освещение.
+18. Направление света.
+19. Тени.
+20. Цветовую гамму.
+21. Композицию.
+22. Ракурс камеры.
+23. Предполагаемое фокусное расстояние.
+24. Глубину резкости.
+25. Размытие фона.
+26. Атмосферу.
+27. Фотографический стиль.
+28. Качество изображения.
+
+После анализа создай подробный
+фотореалистичный промпт на русском языке.
+
+Особенно важно сохранить:
+
+- внешность;
+- черты лица;
+- возраст;
+- цвет глаз;
+- цвет и длину волос;
+- причёску;
+- телосложение;
+- пропорции;
 - выражение лица;
+- положение головы;
+- позу;
 - одежду;
-- обувь;
-- аксессуары;
-- фон;
-- предметы;
-- освещение;
-- направление света;
+- композицию;
+- свет;
 - тени;
-- глубину резкости;
-- цветовую палитру;
-- цветокоррекцию;
-- визуальный стиль;
-- предполагаемую камеру;
-- объектив;
-- предполагаемые параметры съёмки;
+- атмосферу.
 
+Промпт должен начинаться строго словами:
 
-Если точные параметры камеры неизвестны,
-укажи реалистичные предположения.
+"Внешность должна полностью соответствовать прикреплённому референсу:"
 
-Если на изображении есть текст,
-обязательно опиши его.
+Не придумывай изменения внешности человека.
 
-Верни строго JSON.
-
-Структура:
-
-{
-  "photo_title": "",
-  "photo_style": "",
-  "camera_and_settings": "",
-  "shot_type_and_pose_intro": "",
-  "hairstyle_and_makeup": "",
-  "outfit": "",
-  "pose_details": "",
-  "lighting": "",
-  "background": "",
-  "color_grading_and_style": "",
-  "quality_and_style_tags": "",
-  "hashtags": "",
-  "text_in_image": ""
-}
+Ответ верни строго в JSON.
 """
 
+    schema = {
+        "type": "object",
+        "properties": {
 
-def analyze_photo(image_bytes):
+            "summary": {
+                "type": "string"
+            },
 
-    last_error = None
+            "appearance": {
+                "type": "string"
+            },
 
-    mime_type = "image/jpeg"
+            "clothing": {
+                "type": "string"
+            },
 
-    image_part = types.Part.from_bytes(
-        data=image_bytes,
-        mime_type=mime_type
-    )
+            "pose": {
+                "type": "string"
+            },
 
-    for attempt in range(
-        GEMINI_RETRIES
-    ):
+            "environment": {
+                "type": "string"
+            },
 
-        try:
+            "lighting": {
+                "type": "string"
+            },
 
-            logger.info(
-                "Gemini: анализ "
-                "попытка %s/%s",
-                attempt + 1,
-                GEMINI_RETRIES
-            )
+            "camera": {
+                "type": "string"
+            },
 
-            response = (
-                gemini.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        image_part,
-                        ANALYSIS_PROMPT
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type=(
-                            "application/json"
-                        )
-                    )
-                )
-            )
+            "atmosphere": {
+                "type": "string"
+            },
 
-            raw = (
-                response.text or ""
-            ).strip()
+            "prompt": {
+                "type": "string"
+            },
 
-            if not raw:
-                raise RuntimeError(
-                    "Gemini вернул пустой ответ."
-                )
+            "hashtags": {
+                "type": "string"
+            },
 
-            # Если вдруг модель добавила markdown
-            if raw.startswith("```"):
+        },
 
-                lines = raw.splitlines()
-
-                if (
-                    lines
-                    and lines[0].startswith("```")
-                ):
-                    lines = lines[1:]
-
-                if (
-                    lines
-                    and lines[-1].strip() == "```"
-                ):
-                    lines = lines[:-1]
-
-                raw = "\n".join(
-                    lines
-                ).strip()
-
-            result = json.loads(
-                raw
-            )
-
-            logger.info(
-                "Gemini: анализ успешно получен."
-            )
-
-            return result
-
-        except Exception as e:
-
-            last_error = e
-
-            logger.exception(
-                "Ошибка Gemini"
-            )
-
-            if attempt < (
-                GEMINI_RETRIES - 1
-            ):
-
-                time.sleep(
-                    RETRY_DELAYS[attempt]
-                )
-
-    raise RuntimeError(
-        "Gemini не смог обработать "
-        f"изображение: {last_error}"
-    )
-
-
-# ============================================================
-# STANDARD PROMPT
-# ============================================================
-
-def build_standard_prompt(data):
-
-    return f"""📌 Промпт для генерации:
-
-Внешность должна полностью соответствовать
-прикреплённому референсу:
-идентичные черты лица, возраст, рост,
-форма лица, цвет глаз, цвет и длина волос,
-причёска, телосложение, пропорции, макияж,
-выражение лица и общее визуальное впечатление.
-
-Любые изменения внешности,
-стилизация под другого человека
-или искажение типажа недопустимы.
-
-Сюжет:
-{data.get("photo_title", "")}
-
-Стиль:
-{data.get("photo_style", "")}
-
-Камера и параметры:
-{data.get("camera_and_settings", "")}
-
-Ракурс и положение:
-{data.get("shot_type_and_pose_intro", "")}
-
-Причёска и макияж:
-{data.get("hairstyle_and_makeup", "")}
-
-Одежда:
-{data.get("outfit", "")}
-
-Поза:
-{data.get("pose_details", "")}
-
-Освещение:
-{data.get("lighting", "")}
-
-Фон:
-{data.get("background", "")}
-
-Цветокоррекция:
-{data.get("color_grading_and_style", "")}
-
-Текст на изображении:
-{data.get("text_in_image", "")}
-
-Качество:
-{data.get(
-    "quality_and_style_tags",
-    "Максимальный фотореализм, "
-    "высокая детализация, естественная "
-    "анатомия, реалистичная кожа, "
-    "без CGI, без мультяшности, "
-    "без артефактов."
-)}
-""".strip()
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def telegram_send_message(text):
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
+        "required": [
+            "summary",
+            "appearance",
+            "clothing",
+            "pose",
+            "environment",
+            "lighting",
+            "camera",
+            "atmosphere",
+            "prompt",
+            "hashtags",
+        ],
     }
 
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=HTTP_TIMEOUT
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+
+        contents=[
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg",
+            ),
+
+            prompt,
+        ],
+
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
     )
 
-    response.raise_for_status()
+    if not response.text:
 
-    data = response.json()
-
-    if not data.get("ok"):
         raise RuntimeError(
-            f"Telegram API error: {data}"
+            "Gemini вернул пустой ответ."
         )
+
+    return json.loads(
+        response.text
+    )
 
 
 # ============================================================
-# PROCESS ONE PHOTO
+# ОБРАБОТКА ОДНОГО ФОТО
 # ============================================================
 
 def process_one_photo():
 
-    item = get_first_image()
-
-    if not item:
-
-        logger.info(
-            "В папке нет новых изображений."
-        )
-
-        return False
-
-    path = item.get(
-        "path"
+    logger.info(
+        "Проверяем Яндекс.Диск..."
     )
 
-    name = item.get(
-        "name",
-        Path(path).name
+    files = get_yandex_files()
+
+    logger.info(
+        "Файлов найдено: %s",
+        len(files),
+    )
+
+    image = select_image(files)
+
+    if not image:
+
+        logger.info(
+            "Фотографий для обработки нет."
+        )
+
+        telegram_send(
+            "ℹ️ Проверка завершена\n\n"
+            f"📁 Папка: {YANDEX_FOLDER}\n"
+            "📷 Новых фотографий нет."
+        )
+
+        return
+
+    file_name = image["name"]
+    file_path = image["path"]
+
+    logger.info(
+        "Найдена фотография: %s",
+        file_name,
+    )
+
+    telegram_send(
+        "🚀 Начинаю обработку фото\n\n"
+        f"📁 Папка: {YANDEX_FOLDER}\n"
+        f"📷 Файл: {file_name}\n\n"
+        "🔎 Шаг 1/4 — скачивание и анализ..."
+    )
+
+    # -----------------------------------
+    # Скачивание
+    # -----------------------------------
+
+    original_bytes = download_yandex_file(
+        file_path
+    )
+
+    # -----------------------------------
+    # Нормализация
+    # -----------------------------------
+
+    image_bytes = normalize_image(
+        original_bytes
+    )
+
+    # -----------------------------------
+    # Gemini
+    # -----------------------------------
+
+    result = analyze_image(
+        image_bytes
     )
 
     logger.info(
-        "Выбрано фото: %s",
-        path
+        "Gemini анализ завершён."
     )
 
-    # --------------------------------------------------------
-    # Telegram: начало
-    # --------------------------------------------------------
+    # -----------------------------------
+    # Telegram
+    # -----------------------------------
 
-    telegram_send_message(
-        "🚀 Начинаю обработку фото\n\n"
-        f"📁 Файл: {name}\n"
-        f"📂 Папка: {YANDEX_FOLDER}\n\n"
-        "🔍 Шаг 1/4 — скачивание и анализ..."
-    )
-
-    # --------------------------------------------------------
-    # Download
-    # --------------------------------------------------------
-
-    image_bytes = (
-        yandex_download_file(
-            path
-        )
-    )
-
-    normalized_bytes = (
-        normalize_image(
-            image_bytes
-        )
-    )
-
-    # --------------------------------------------------------
-    # Gemini
-    # --------------------------------------------------------
-
-    analysis = analyze_photo(
-        normalized_bytes
-    )
-
-    prompt = build_standard_prompt(
-        analysis
-    )
-
-    title = analysis.get(
-        "photo_title",
-        "Без названия"
-    )
-
-    hashtags = analysis.get(
-        "hashtags",
-        ""
-    )
-
-    # --------------------------------------------------------
-    # Telegram result
-    # --------------------------------------------------------
-
-    text = (
+    first_message = (
         "✅ Фото успешно обработано\n\n"
-        f"📁 Файл: {name}\n"
-        f"📌 Название: {title}\n\n"
-        "🔍 Анализ Gemini 3.6 завершён\n"
+
+        f"📁 Файл:\n"
+        f"{file_name}\n\n"
+
+        "📌 Название:\n"
+        f"{result['summary']}\n\n"
+
+        "🔎 Анализ Gemini 3.6 завершён\n"
         "📝 Стандартный промпт создан\n\n"
+
         "🏷 Хэштеги:\n"
-        f"{hashtags}\n\n"
+        f"{result['hashtags']}\n\n"
+
         "📂 Источник:\n"
-        f"{path}\n\n"
+        f"{file_path}\n\n"
+
         "🗑 Исходный файл будет удалён "
-        "с Яндекс.Диска после успешного "
-        "завершения обработки."
+        "после успешного завершения обработки."
     )
 
-    telegram_send_message(
-        text
+    telegram_send(
+        first_message
     )
 
-    # --------------------------------------------------------
-    # Prompt
-    # --------------------------------------------------------
+    # -----------------------------------
+    # Готовый промпт
+    # -----------------------------------
 
-    telegram_send_message(
-        "📝 Готовый промпт:\n\n"
-        + prompt
+    prompt_message = (
+        "📝 ГОТОВЫЙ ПРОМПТ\n\n"
+        "📌 Промпт для генерации:\n\n"
+        f"{result['prompt']}"
     )
 
-    # --------------------------------------------------------
-    # DELETE
-    # --------------------------------------------------------
+    max_length = 4000
 
-    yandex_delete_file(
-        path
+    if len(prompt_message) <= max_length:
+
+        telegram_send(
+            prompt_message
+        )
+
+    else:
+
+        telegram_send(
+            "📝 ГОТОВЫЙ ПРОМПТ\n\n"
+            "Промпт длинный, поэтому отправляю "
+            "его несколькими сообщениями."
+        )
+
+        text = result["prompt"]
+
+        for start in range(
+            0,
+            len(text),
+            max_length,
+        ):
+
+            telegram_send(
+                text[
+                    start:start + max_length
+                ]
+            )
+
+    # -----------------------------------
+    # Удаление исходника
+    # -----------------------------------
+
+    delete_yandex_file(
+        file_path
     )
 
-    telegram_send_message(
+    logger.info(
+        "Исходный файл удалён: %s",
+        file_path,
+    )
+
+    telegram_send(
         "🎉 Готово!\n\n"
-        f"✅ Обработано: {name}\n"
+
+        f"✅ Обработано: {file_name}\n"
         "✅ Gemini-анализ создан\n"
         "✅ Промпт создан\n"
         "✅ Исходник удалён с Яндекс.Диска\n\n"
-        "📌 VK пока не используется — "
-        "подключим публикацию после решения "
-        "вопроса с VK API."
-    )
 
-    return True
+        "📌 VK пока не используется — "
+        "сейчас проверяем VK API."
+    )
 
 
 # ============================================================
-# WORKER
+# MAIN
 # ============================================================
 
 def main():
 
-    logger.info(
-        "================================================"
+    check_env()
+
+    # --------------------------------------------------------
+    # ПРОВЕРКА VK
+    # --------------------------------------------------------
+
+    vk_ok = test_vk()
+
+    if vk_ok:
+
+        logger.info(
+            "✅ VK: авторизация и доступ к группе работают."
+        )
+
+        telegram_send(
+            "✅ Проверка VK пройдена\n\n"
+            f"🏠 Группа ID: {VK_GROUP_ID}\n"
+            "🔑 Доступ к VK API подтверждён.\n\n"
+            "📌 Публикация пока не включена."
+        )
+
+    else:
+
+        logger.error(
+            "❌ VK: проверка не пройдена."
+        )
+
+        telegram_send(
+            "⚠️ Проверка VK не пройдена\n\n"
+            "Автоматизация Яндекс.Диск → "
+            "Gemini → Telegram продолжит работу.\n\n"
+            "📌 Публикация в VK пока отключена."
+        )
+
+    # --------------------------------------------------------
+    # ЗАПУСК АВТОМАТИЗАЦИИ
+    # --------------------------------------------------------
+
+    telegram_send(
+        "🚀 Автоматизация запущена\n\n"
+
+        f"📁 Папка: {YANDEX_FOLDER}\n"
+        "⏱ Интервал: 2 часа\n"
+        "📷 За один запуск: 1 фотография\n"
+        "🤖 Gemini: включён\n"
+        f"🔵 VK: {'доступ есть' if vk_ok else 'проверка не пройдена'}\n\n"
+
+        "⏳ Ожидаю фотографии..."
     )
 
-    logger.info(
-        "🚀 Yandex → Gemini worker запущен"
-    )
-
-    logger.info(
-        "Папка: %s",
-        YANDEX_FOLDER
-    )
-
-    logger.info(
-        "Интервал: 2 часа"
-    )
-
-    logger.info(
-        "За один запуск: 1 фото"
-    )
-
-    logger.info(
-        "Gemini: %s",
-        GEMINI_MODEL
-    )
-
-    logger.info(
-        "================================================"
-    )
+    # --------------------------------------------------------
+    # ОСНОВНОЙ ЦИКЛ
+    # --------------------------------------------------------
 
     while True:
-
-        started_at = time.time()
 
         try:
 
@@ -765,47 +817,36 @@ def main():
         except Exception as e:
 
             logger.exception(
-                "Ошибка обработки"
+                "Ошибка обработки."
             )
 
             try:
 
-                telegram_send_message(
-                    "❌ Автоматическая обработка "
-                    "завершилась ошибкой.\n\n"
-                    f"{e}\n\n"
-                    "⚠️ Исходный файл НЕ удалён."
+                telegram_send(
+                    "❌ Ошибка автоматизации\n\n"
+                    f"{type(e).__name__}: {e}"
                 )
 
             except Exception:
 
                 logger.exception(
-                    "Не удалось отправить "
-                    "ошибку в Telegram"
+                    "Не удалось отправить сообщение "
+                    "об ошибке в Telegram."
                 )
 
-        elapsed = (
-            time.time() - started_at
-        )
-
-        sleep_seconds = max(
-            1,
-            INTERVAL_SECONDS - elapsed
-        )
-
         logger.info(
-            "Следующая проверка через "
-            "%s минут.",
-            round(
-                sleep_seconds / 60,
-                1
-            )
+            "Следующая проверка через 2 часа..."
         )
 
         time.sleep(
-            sleep_seconds
+            CHECK_INTERVAL
         )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
