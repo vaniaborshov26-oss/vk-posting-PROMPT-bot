@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -16,18 +17,21 @@ from google.genai import types
 # НАСТРОЙКИ
 # ============================================================
 
-# -------------------------
+# ------------------------------------------------------------
 # VK
-# -------------------------
+# ------------------------------------------------------------
 
 VK_API_VERSION = "5.131"
+
 VK_GROUP_ID = os.getenv("VK_GROUP_ID")
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
 
+VK_TIMEOUT = 120
 
-# -------------------------
-# YANDEX DISK
-# -------------------------
+
+# ------------------------------------------------------------
+# ЯНДЕКС.ДИСК
+# ------------------------------------------------------------
 
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
 
@@ -36,35 +40,67 @@ YANDEX_FOLDER = os.getenv(
     "disk:/Нейрофото"
 )
 
+YANDEX_API = "https://cloud-api.yandex.net/v1/disk"
 
-# -------------------------
+
+# ------------------------------------------------------------
 # GEMINI
-# -------------------------
+# ------------------------------------------------------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+TEXT_MODEL = "gemini-3.6-flash"
 
 
-# -------------------------
+# ------------------------------------------------------------
 # TELEGRAM
-# -------------------------
+# ------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-
-# -------------------------
-# ПРОЧИЕ НАСТРОЙКИ
-# -------------------------
-
-CHECK_INTERVAL = 2 * 60 * 60  # 2 часа
-
-YANDEX_API = "https://cloud-api.yandex.net/v1/disk"
-
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 )
+
+
+# ------------------------------------------------------------
+# ИНТЕРВАЛ ПУБЛИКАЦИЙ
+# ------------------------------------------------------------
+
+# По умолчанию публикация каждые 2 часа.
+#
+# За один цикл:
+# 1 фото -> 1 анализ -> 1 пост VK
+#
+# После завершения цикла программа ждёт
+# POST_INTERVAL_HOURS часов.
+#
+# Например:
+# POST_INTERVAL_HOURS=2
+#
+# Первый цикл выполняется сразу после запуска,
+# затем следующий через 2 часа.
+# ------------------------------------------------------------
+
+POST_INTERVAL_HOURS = float(
+    os.getenv("POST_INTERVAL_HOURS", "2")
+)
+
+POST_INTERVAL_SECONDS = int(
+    POST_INTERVAL_HOURS * 60 * 60
+)
+
+
+# ------------------------------------------------------------
+# ДОПОЛНИТЕЛЬНЫЕ ПАРАМЕТРЫ
+# ------------------------------------------------------------
+
+TELEGRAM_MAX_LENGTH = 3900
+
+GEMINI_RETRY_DELAYS = [3, 7, 15]
+
+VK_RETRY_DELAYS = [3, 7, 15]
 
 
 # ============================================================
@@ -80,7 +116,22 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ПРОВЕРКА ПЕРЕМЕННЫХ
+# GEMINI CLIENT
+# ============================================================
+
+if GEMINI_API_KEY:
+
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+else:
+
+    client = None
+
+
+# ============================================================
+# ПРОВЕРКА ENV
 # ============================================================
 
 def check_env():
@@ -102,12 +153,29 @@ def check_env():
     ]
 
     if missing:
+
         raise RuntimeError(
             "Не заданы переменные окружения: "
             + ", ".join(missing)
         )
 
-    logger.info("Все необходимые переменные окружения найдены.")
+    logger.info(
+        "Все необходимые переменные окружения найдены."
+    )
+
+    logger.info(
+        "Папка Яндекс.Диска: %s",
+        YANDEX_FOLDER
+    )
+
+    logger.info(
+        "Интервал публикаций: %.2f часа",
+        POST_INTERVAL_HOURS
+    )
+
+    logger.info(
+        "За один цикл: 1 фотография"
+    )
 
 
 # ============================================================
@@ -128,9 +196,8 @@ def telegram_send(text: str):
         timeout=30,
     )
 
-    # В случае ошибки Telegram выводим его настоящий ответ
-    # в лог, чтобы было понятно, что именно произошло.
     if not response.ok:
+
         logger.error(
             "Telegram error: HTTP %s | %s",
             response.status_code,
@@ -140,134 +207,24 @@ def telegram_send(text: str):
     response.raise_for_status()
 
 
-# ============================================================
-# VK — ТЕСТ АВТОРИЗАЦИИ
-# ============================================================
+def telegram_send_long(text: str):
 
-def test_vk():
+    if len(text) <= TELEGRAM_MAX_LENGTH:
 
-    logger.info("")
-    logger.info("======================================")
-    logger.info("          VK AUTH TEST")
-    logger.info("======================================")
+        telegram_send(text)
+        return
 
-    if not VK_ACCESS_TOKEN:
-        logger.error("VK_ACCESS_TOKEN не задан.")
-        return False
+    for start in range(
+        0,
+        len(text),
+        TELEGRAM_MAX_LENGTH
+    ):
 
-    if not VK_GROUP_ID:
-        logger.error("VK_GROUP_ID не задан.")
-        return False
+        chunk = text[
+            start:start + TELEGRAM_MAX_LENGTH
+        ]
 
-    logger.info("VK_GROUP_ID: %s", VK_GROUP_ID)
-    logger.info("VK API VERSION: %s", VK_API_VERSION)
-    logger.info("Проверяем доступ к VK...")
-
-    url = "https://api.vk.com/method/groups.getById"
-
-    params = {
-        "group_id": VK_GROUP_ID,
-        "access_token": VK_ACCESS_TOKEN,
-        "v": VK_API_VERSION,
-    }
-
-    try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=30,
-        )
-
-        logger.info(
-            "VK HTTP STATUS: %s",
-            response.status_code,
-        )
-
-        logger.info(
-            "VK RESPONSE: %s",
-            response.text,
-        )
-
-        if not response.ok:
-            logger.error(
-                "VK вернул HTTP ошибку."
-            )
-            return False
-
-        data = response.json()
-
-        # VK API вернул ошибку
-        if "error" in data:
-
-            error = data["error"]
-
-            logger.error(
-                "VK ERROR CODE: %s",
-                error.get("error_code"),
-            )
-
-            logger.error(
-                "VK ERROR MESSAGE: %s",
-                error.get("error_msg"),
-            )
-
-            logger.error(
-                "Полная ошибка VK: %s",
-                error,
-            )
-
-            logger.info(
-                "======================================"
-            )
-
-            return False
-
-        # Успешный ответ
-        if "response" in data:
-
-            logger.info(
-                "VK AUTH OK"
-            )
-
-            logger.info(
-                "Доступ к группе получен."
-            )
-
-            logger.info(
-                "VK RESPONSE DATA: %s",
-                data["response"],
-            )
-
-            logger.info(
-                "======================================"
-            )
-
-            return True
-
-        logger.warning(
-            "VK вернул неожиданный ответ: %s",
-            data,
-        )
-
-        logger.info(
-            "======================================"
-        )
-
-        return False
-
-    except Exception as e:
-
-        logger.exception(
-            "Ошибка при проверке VK: %s",
-            e,
-        )
-
-        logger.info(
-            "======================================"
-        )
-
-        return False
+        telegram_send(chunk)
 
 
 # ============================================================
@@ -283,10 +240,8 @@ def yandex_headers():
 
 def get_yandex_files():
 
-    url = f"{YANDEX_API}/resources"
-
     response = requests.get(
-        url,
+        f"{YANDEX_API}/resources",
         headers=yandex_headers(),
         params={
             "path": YANDEX_FOLDER,
@@ -300,16 +255,14 @@ def get_yandex_files():
 
     data = response.json()
 
-    return data.get(
-        "_embedded",
-        {}
-    ).get(
-        "items",
-        []
+    return (
+        data
+        .get("_embedded", {})
+        .get("items", [])
     )
 
 
-def select_image(files):
+def select_one_image(files):
 
     image_extensions = {
         ".jpg",
@@ -317,7 +270,7 @@ def select_image(files):
         ".png",
         ".webp",
         ".bmp",
-        ".heic",
+        ".gif",
     }
 
     for item in files:
@@ -325,19 +278,25 @@ def select_image(files):
         if item.get("type") != "file":
             continue
 
-        name = item.get("name", "")
+        name = item.get(
+            "name",
+            ""
+        )
 
         extension = Path(
             name
         ).suffix.lower()
 
         if extension in image_extensions:
+
             return item
 
     return None
 
 
-def download_yandex_file(path: str) -> bytes:
+def download_yandex_file(
+    path: str
+) -> bytes:
 
     response = requests.get(
         f"{YANDEX_API}/resources/download",
@@ -364,7 +323,9 @@ def download_yandex_file(path: str) -> bytes:
     return file_response.content
 
 
-def delete_yandex_file(path: str):
+def delete_yandex_file(
+    path: str
+):
 
     response = requests.delete(
         f"{YANDEX_API}/resources",
@@ -378,378 +339,1445 @@ def delete_yandex_file(path: str):
 
     response.raise_for_status()
 
+    logger.info(
+        "Файл удалён с Яндекс.Диска: %s",
+        path
+    )
+
 
 # ============================================================
 # IMAGE
 # ============================================================
 
-def normalize_image(file_bytes: bytes) -> bytes:
-
-    image = Image.open(
-        io.BytesIO(file_bytes)
-    )
-
-    if image.mode not in (
-        "RGB",
-        "RGBA",
-    ):
-        image = image.convert("RGB")
-
-    output = io.BytesIO()
-
-    image.save(
-        output,
-        format="JPEG",
-        quality=95,
-    )
-
-    return output.getvalue()
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-def analyze_image(
+def get_image_mime_type(
     image_bytes: bytes
-) -> dict[str, Any]:
+):
 
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
+    try:
 
-    prompt = """
-Ты профессиональный аналитик изображений
-и специалист по созданию фотореалистичных
-промптов для генерации изображений.
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
 
-Внимательно проанализируй предоставленную фотографию.
+        fmt = (
+            image.format
+            or "JPEG"
+        ).upper()
 
-Определи:
+        mapping = {
+            "JPEG": "image/jpeg",
+            "JPG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+            "GIF": "image/gif",
+        }
 
-1. Кто изображён на фотографии.
-2. Пол и примерный возраст.
-3. Внешность человека.
-4. Форму лица.
-5. Волосы и причёску.
-6. Цвет глаз.
-7. Одежду.
-8. Аксессуары.
-9. Положение тела.
-10. Положение головы.
-11. Выражение лица.
-12. Направление взгляда.
-13. Положение рук.
-14. Окружение.
-15. Фон.
-16. Передний и задний план.
-17. Освещение.
-18. Направление света.
-19. Тени.
-20. Цветовую гамму.
-21. Композицию.
-22. Ракурс камеры.
-23. Предполагаемое фокусное расстояние.
-24. Глубину резкости.
-25. Размытие фона.
-26. Атмосферу.
-27. Фотографический стиль.
-28. Качество изображения.
+        return mapping.get(
+            fmt,
+            "image/jpeg"
+        )
 
-После анализа создай подробный
-фотореалистичный промпт на русском языке.
+    except Exception:
 
-Особенно важно сохранить:
+        return "image/jpeg"
 
-- внешность;
-- черты лица;
-- возраст;
-- цвет глаз;
-- цвет и длину волос;
-- причёску;
-- телосложение;
-- пропорции;
-- выражение лица;
-- положение головы;
-- позу;
-- одежду;
-- композицию;
-- свет;
-- тени;
-- атмосферу.
 
-Промпт должен начинаться строго словами:
+def normalize_image(
+    image_bytes: bytes
+) -> bytes:
 
-"Внешность должна полностью соответствовать прикреплённому референсу:"
+    try:
 
-Не придумывай изменения внешности человека.
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
 
-Ответ верни строго в JSON.
-"""
+        logger.info(
+            "Исходный формат изображения: %s",
+            image.format
+        )
 
-    schema = {
-        "type": "object",
-        "properties": {
+        logger.info(
+            "Размер изображения: %s",
+            image.size
+        )
 
-            "summary": {
-                "type": "string"
-            },
+        rgb = image.convert(
+            "RGB"
+        )
 
-            "appearance": {
-                "type": "string"
-            },
+        buffer = io.BytesIO()
 
-            "clothing": {
-                "type": "string"
-            },
+        rgb.save(
+            buffer,
+            format="JPEG",
+            quality=95
+        )
 
-            "pose": {
-                "type": "string"
-            },
+        result = buffer.getvalue()
 
-            "environment": {
-                "type": "string"
-            },
+        logger.info(
+            "JPEG подготовлен: %s байт",
+            len(result)
+        )
 
-            "lighting": {
-                "type": "string"
-            },
+        return result
 
-            "camera": {
-                "type": "string"
-            },
+    except Exception as e:
 
-            "atmosphere": {
-                "type": "string"
-            },
+        raise RuntimeError(
+            f"Не удалось подготовить изображение: {e}"
+        ) from e
 
-            "prompt": {
-                "type": "string"
-            },
 
-            "hashtags": {
-                "type": "string"
-            },
+# ============================================================
+# JSON HELPERS
+# ============================================================
 
-        },
+def clean_json_response(
+    raw_text: str
+):
 
-        "required": [
-            "summary",
-            "appearance",
-            "clothing",
-            "pose",
-            "environment",
-            "lighting",
-            "camera",
-            "atmosphere",
-            "prompt",
-            "hashtags",
-        ],
-    }
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-
-        contents=[
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type="image/jpeg",
-            ),
-
-            prompt,
-        ],
-
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
-    )
-
-    if not response.text:
+    if not raw_text:
 
         raise RuntimeError(
             "Gemini вернул пустой ответ."
         )
 
-    return json.loads(
-        response.text
+    text = raw_text.strip()
+
+    if text.startswith("```"):
+
+        lines = text.splitlines()
+
+        if (
+            lines
+            and lines[0].startswith("```")
+        ):
+
+            lines = lines[1:]
+
+        if (
+            lines
+            and lines[-1].strip() == "```"
+        ):
+
+            lines = lines[:-1]
+
+        text = "\n".join(
+            lines
+        ).strip()
+
+    return text
+
+
+def parse_json(
+    text: str
+):
+
+    cleaned = clean_json_response(
+        text
+    )
+
+    try:
+
+        return json.loads(
+            cleaned
+        )
+
+    except json.JSONDecodeError as e:
+
+        raise RuntimeError(
+            "Gemini вернул некорректный JSON.\n\n"
+            + cleaned[:5000]
+        ) from e
+
+
+# ============================================================
+# GEMINI
+# ПОДРОБНЫЙ АНАЛИЗ РЕФЕРЕНСА
+# ============================================================
+
+def analyze_reference(
+    image_bytes: bytes
+) -> dict[str, Any]:
+
+    prompt = r"""
+Ты — профессиональный visual analyst и prompt engineer
+для фотореалистичной генерации изображений.
+
+Проанализируй прикреплённый референс максимально подробно.
+
+Главная задача:
+не придумать новое изображение,
+а восстановить максимально точное техническое описание
+того, ЧТО УЖЕ находится в референсе.
+
+КРИТИЧЕСКИ ВАЖНО:
+
+Если на изображении присутствует человек,
+внешность должна описываться максимально точно,
+без выдумывания отсутствующих деталей.
+
+Нельзя:
+- делать человека моложе или старше;
+- идеализировать лицо;
+- менять типаж;
+- придумывать новую причёску;
+- придумывать другой цвет волос;
+- менять телосложение;
+- добавлять несуществующий макияж;
+- придумывать аксессуары;
+- придумывать одежду, которой нет;
+- придумывать детали фона, которых нет на фото.
+
+Особенно внимательно анализируй:
+
+1. Композицию.
+2. Кадрирование.
+3. Соотношение сторон.
+4. Размер и положение главного объекта.
+5. Положение человека/людей.
+6. Направление взгляда.
+7. Положение головы.
+8. Положение корпуса.
+9. Положение рук.
+10. Положение пальцев.
+11. Положение ног.
+12. Причёску.
+13. Черты внешнего образа без выдумывания новых деталей.
+14. Макияж.
+15. Одежду.
+16. Материалы и текстуры одежды.
+17. Аксессуары.
+18. Фон.
+19. Предметы вокруг.
+20. Перспективу.
+21. Глубину резкости.
+22. Освещение.
+23. Направление света.
+24. Тени.
+25. Цветовую палитру.
+26. Цветокоррекцию.
+27. Атмосферу.
+28. Предполагаемую камеру и объектив.
+29. Возможные параметры съёмки.
+30. Любой текст, логотипы или надписи на изображении.
+
+Если точные параметры камеры неизвестны,
+укажи реалистичное предположение,
+но НЕ выдавай предположение за достоверный факт.
+
+Если в изображении присутствует текст,
+обязательно укажи:
+- его содержание;
+- язык;
+- расположение;
+- визуальное оформление.
+
+Создай название фотографии.
+
+Создай релевантные хэштеги.
+
+Верни ТОЛЬКО JSON.
+
+Структура JSON:
+
+{
+  "photo_title": "",
+
+  "composition": {
+    "aspect_ratio": "",
+    "shot_type": "",
+    "framing": "",
+    "camera_angle": "",
+    "subject_position": "",
+    "perspective": ""
+  },
+
+  "subject": {
+    "count": 0,
+    "description": "",
+    "position": "",
+    "scale_in_frame": ""
+  },
+
+  "face_and_expression": {
+    "head_position": "",
+    "gaze": "",
+    "expression": "",
+    "makeup": "",
+    "skin": ""
+  },
+
+  "hair": {
+    "color": "",
+    "length": "",
+    "style": "",
+    "details": ""
+  },
+
+  "outfit": {
+    "description": "",
+    "colors": "",
+    "materials": "",
+    "shoes": "",
+    "accessories": ""
+  },
+
+  "pose": {
+    "body": "",
+    "head": "",
+    "left_arm": "",
+    "right_arm": "",
+    "left_hand": "",
+    "right_hand": "",
+    "legs": "",
+    "feet": ""
+  },
+
+  "environment": {
+    "location": "",
+    "background": "",
+    "foreground": "",
+    "objects": ""
+  },
+
+  "lighting": {
+    "type": "",
+    "source": "",
+    "direction": "",
+    "hardness": "",
+    "shadows": "",
+    "rim_light": ""
+  },
+
+  "camera": {
+    "camera_type": "",
+    "lens": "",
+    "aperture": "",
+    "iso": "",
+    "shutter_speed": "",
+    "depth_of_field": ""
+  },
+
+  "color": {
+    "palette": "",
+    "grading": "",
+    "contrast": "",
+    "saturation": "",
+    "white_balance": ""
+  },
+
+  "text_in_image": {
+    "present": false,
+    "language": "",
+    "content": "",
+    "position": "",
+    "style": ""
+  },
+
+  "style": "",
+  "quality": "",
+  "hashtags": ""
+}
+"""
+
+    mime_type = get_image_mime_type(
+        image_bytes
+    )
+
+    image_part = types.Part.from_bytes(
+        data=image_bytes,
+        mime_type=mime_type
+    )
+
+    last_error = None
+
+    for attempt in range(3):
+
+        try:
+
+            logger.info(
+                "Gemini анализ: попытка %s/3",
+                attempt + 1
+            )
+
+            response = client.models.generate_content(
+                model=TEXT_MODEL,
+                contents=[
+                    image_part,
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+
+            data = parse_json(
+                response.text
+            )
+
+            logger.info(
+                "Gemini JSON анализа получен."
+            )
+
+            return data
+
+        except Exception as e:
+
+            last_error = e
+
+            logger.error(
+                "Gemini ошибка анализа: %s",
+                e
+            )
+
+            if attempt < 2:
+
+                time.sleep(
+                    GEMINI_RETRY_DELAYS[
+                        attempt
+                    ]
+                )
+
+    raise RuntimeError(
+        "Не удалось проанализировать референс: "
+        f"{last_error}"
     )
 
 
 # ============================================================
-# ОБРАБОТКА ОДНОГО ФОТО
+# ФОРМИРОВАНИЕ СТАНДАРТНОГО ПРОМПТА
+# ============================================================
+
+def build_standard_prompt(
+    data: dict[str, Any]
+) -> str:
+
+    composition = data.get(
+        "composition",
+        {}
+    )
+
+    subject = data.get(
+        "subject",
+        {}
+    )
+
+    face = data.get(
+        "face_and_expression",
+        {}
+    )
+
+    hair = data.get(
+        "hair",
+        {}
+    )
+
+    outfit = data.get(
+        "outfit",
+        {}
+    )
+
+    pose = data.get(
+        "pose",
+        {}
+    )
+
+    environment = data.get(
+        "environment",
+        {}
+    )
+
+    lighting = data.get(
+        "lighting",
+        {}
+    )
+
+    camera = data.get(
+        "camera",
+        {}
+    )
+
+    color = data.get(
+        "color",
+        {}
+    )
+
+    text_info = data.get(
+        "text_in_image",
+        {}
+    )
+
+    prompt = f"""
+Внешность должна полностью соответствовать
+прикреплённому референсу.
+
+Сохрани индивидуальный визуальный образ человека:
+форму лица, пропорции, глаза, нос, губы, кожу,
+возрастное впечатление, волосы, причёску,
+мимику и общее визуальное восприятие.
+
+СТРОГО ЗАПРЕЩЕНО:
+изменять идентичность человека,
+менять черты лица,
+омолаживать или состаривать человека,
+изменять телосложение и пропорции,
+менять цвет и длину волос,
+изменять причёску,
+изменять выражение лица без необходимости,
+идеализировать лицо,
+делать кожу неестественно гладкой,
+добавлять новые черты внешности.
+
+Не идеализируй лицо.
+Не меняй типаж.
+Не делай человека моложе или старше.
+Не добавляй новые черты.
+
+КЛЮЧЕВАЯ ЗАДАЧА:
+максимально точно воспроизвести референс,
+а не создать просто похожую сцену.
+
+СЮЖЕТ:
+{data.get("photo_title", "")}
+
+КОМПОЗИЦИЯ:
+
+Соотношение сторон:
+{composition.get("aspect_ratio", "")}
+
+Тип кадра:
+{composition.get("shot_type", "")}
+
+Кадрирование:
+{composition.get("framing", "")}
+
+Ракурс камеры:
+{composition.get("camera_angle", "")}
+
+Положение объекта:
+{composition.get("subject_position", "")}
+
+Перспектива:
+{composition.get("perspective", "")}
+
+
+ГЛАВНЫЙ ОБЪЕКТ:
+
+Количество объектов/людей:
+{subject.get("count", "")}
+
+Описание:
+{subject.get("description", "")}
+
+Положение:
+{subject.get("position", "")}
+
+Размер в кадре:
+{subject.get("scale_in_frame", "")}
+
+
+ЛИЦО И ВЫРАЖЕНИЕ:
+
+Положение головы:
+{face.get("head_position", "")}
+
+Взгляд:
+{face.get("gaze", "")}
+
+Выражение лица:
+{face.get("expression", "")}
+
+Макияж:
+{face.get("makeup", "")}
+
+Кожа:
+{face.get("skin", "")}
+
+
+ВОЛОСЫ:
+
+Цвет:
+{hair.get("color", "")}
+
+Длина:
+{hair.get("length", "")}
+
+Причёска:
+{hair.get("style", "")}
+
+Детали:
+{hair.get("details", "")}
+
+
+ОДЕЖДА:
+
+{outfit.get("description", "")}
+
+Цвета:
+{outfit.get("colors", "")}
+
+Материалы и фактура:
+{outfit.get("materials", "")}
+
+Обувь:
+{outfit.get("shoes", "")}
+
+Аксессуары:
+{outfit.get("accessories", "")}
+
+
+ПОЗА:
+
+Корпус:
+{pose.get("body", "")}
+
+Голова:
+{pose.get("head", "")}
+
+Левая рука:
+{pose.get("left_arm", "")}
+
+Правая рука:
+{pose.get("right_arm", "")}
+
+Левая кисть:
+{pose.get("left_hand", "")}
+
+Правая кисть:
+{pose.get("right_hand", "")}
+
+Ноги:
+{pose.get("legs", "")}
+
+Стопы:
+{pose.get("feet", "")}
+
+
+ОКРУЖЕНИЕ:
+
+Локация:
+{environment.get("location", "")}
+
+Фон:
+{environment.get("background", "")}
+
+Передний план:
+{environment.get("foreground", "")}
+
+Предметы:
+{environment.get("objects", "")}
+
+
+ОСВЕЩЕНИЕ:
+
+Тип света:
+{lighting.get("type", "")}
+
+Источник:
+{lighting.get("source", "")}
+
+Направление:
+{lighting.get("direction", "")}
+
+Жёсткость:
+{lighting.get("hardness", "")}
+
+Тени:
+{lighting.get("shadows", "")}
+
+Контровой свет:
+{lighting.get("rim_light", "")}
+
+
+КАМЕРА:
+
+Камера:
+{camera.get("camera_type", "")}
+
+Объектив:
+{camera.get("lens", "")}
+
+Диафрагма:
+{camera.get("aperture", "")}
+
+ISO:
+{camera.get("iso", "")}
+
+Выдержка:
+{camera.get("shutter_speed", "")}
+
+Глубина резкости:
+{camera.get("depth_of_field", "")}
+
+
+ЦВЕТОКОРРЕКЦИЯ:
+
+Палитра:
+{color.get("palette", "")}
+
+Грейдинг:
+{color.get("grading", "")}
+
+Контраст:
+{color.get("contrast", "")}
+
+Насыщенность:
+{color.get("saturation", "")}
+
+Баланс белого:
+{color.get("white_balance", "")}
+
+
+ТЕКСТ НА ИЗОБРАЖЕНИИ:
+
+Наличие:
+{text_info.get("present", False)}
+
+Язык:
+{text_info.get("language", "")}
+
+Содержание:
+{text_info.get("content", "")}
+
+Положение:
+{text_info.get("position", "")}
+
+Стиль текста:
+{text_info.get("style", "")}
+
+
+СТИЛЬ:
+
+{data.get("style", "")}
+
+
+КАЧЕСТВО:
+
+{data.get("quality", "")}
+
+
+СОХРАНИ:
+
+оригинальную композицию,
+геометрию,
+ракурс,
+кадрирование,
+расположение объектов,
+позу,
+положение головы,
+руки и пальцы,
+масштаб объекта в кадре,
+освещение,
+фон,
+цветовую логику,
+атмосферу
+и визуальный характер референса.
+
+Не добавляй элементы,
+которых нет в референсе.
+
+Не удаляй важные элементы
+референса.
+
+Максимальный фотореализм.
+Естественная анатомия.
+Реалистичная кожа.
+Естественная текстура кожи.
+Высокая детализация.
+Натуральные волосы.
+Реалистичные глаза.
+Реалистичный свет.
+Реалистичные тени.
+
+Без CGI.
+Без мультяшности.
+Без пластиковой кожи.
+Без деформаций.
+Без лишних пальцев.
+Без лишних конечностей.
+Без анатомических ошибок.
+"""
+
+    return prompt.strip()
+
+
+# ============================================================
+# VK HELPERS
+# ============================================================
+
+def safe_json_response(
+    response,
+    source_name: str
+):
+
+    try:
+
+        return response.json()
+
+    except ValueError:
+
+        raise RuntimeError(
+            f"{source_name} вернул не JSON.\n"
+            f"HTTP: {response.status_code}\n"
+            f"Ответ: {response.text[:3000]}"
+        )
+
+
+def vk_call(
+    method_name: str,
+    params=None,
+    data=None
+):
+
+    clean_method = (
+        method_name
+        .strip()
+        .split("/")[-1]
+        .replace(".json", "")
+    )
+
+    url = (
+        "https://api.vk.com/method/"
+        + clean_method
+    )
+
+    last_error = None
+
+    for attempt in range(3):
+
+        try:
+
+            if data is not None:
+
+                response = requests.post(
+                    url,
+                    data=data,
+                    timeout=VK_TIMEOUT
+                )
+
+            else:
+
+                response = requests.get(
+                    url,
+                    params=params or {},
+                    timeout=VK_TIMEOUT
+                )
+
+            result = safe_json_response(
+                response,
+                f"VK {clean_method}"
+            )
+
+            if "error" in result:
+
+                logger.error(
+                    "VK %s error: %s",
+                    clean_method,
+                    result["error"]
+                )
+
+            return result
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.RequestException
+        ) as e:
+
+            last_error = e
+
+            logger.error(
+                "VK HTTP ошибка %s, попытка %s/3: %s",
+                clean_method,
+                attempt + 1,
+                e
+            )
+
+            if attempt < 2:
+
+                time.sleep(
+                    VK_RETRY_DELAYS[
+                        attempt
+                    ]
+                )
+
+    raise RuntimeError(
+        f"Ошибка HTTP VK "
+        f"{clean_method}: {last_error}"
+    )
+
+
+# ============================================================
+# VK POST
+# ============================================================
+
+def post_to_vk(
+    image_bytes: bytes,
+    wall_text: str,
+    comment_text: str
+) -> str:
+
+    group_id = int(
+        str(VK_GROUP_ID)
+        .replace("-", "")
+    )
+
+    # --------------------------------------------------------
+    # 1. Получаем upload server
+    # --------------------------------------------------------
+
+    logger.info(
+        "VK: получаем upload server..."
+    )
+
+    server_res = vk_call(
+        "photos.getWallUploadServer",
+        params={
+            "group_id": group_id,
+            "access_token": VK_ACCESS_TOKEN.strip(),
+            "v": VK_API_VERSION
+        }
+    )
+
+    if "error" in server_res:
+
+        raise RuntimeError(
+            "VK getWallUploadServer: "
+            f"{server_res['error']}"
+        )
+
+    if (
+        "response" not in server_res
+        or "upload_url"
+        not in server_res["response"]
+    ):
+
+        raise RuntimeError(
+            "VK не вернул upload_url:\n"
+            f"{server_res}"
+        )
+
+    upload_url = (
+        server_res["response"]["upload_url"]
+    )
+
+    # --------------------------------------------------------
+    # 2. Загружаем фотографию
+    # --------------------------------------------------------
+
+    logger.info(
+        "VK: загружаем фотографию..."
+    )
+
+    files = {
+        "photo": (
+            "photo.jpg",
+            image_bytes,
+            "image/jpeg"
+        )
+    }
+
+    upload_response = requests.post(
+        upload_url,
+        files=files,
+        timeout=VK_TIMEOUT
+    )
+
+    upload_res = safe_json_response(
+        upload_response,
+        "VK upload server"
+    )
+
+    logger.info(
+        "[VK] Upload response: %s",
+        upload_res
+    )
+
+    if "error" in upload_res:
+
+        raise RuntimeError(
+            f"VK upload error: "
+            f"{upload_res['error']}"
+        )
+
+    server = upload_res.get(
+        "server"
+    )
+
+    photo = upload_res.get(
+        "photo"
+    )
+
+    vk_hash = upload_res.get(
+        "hash"
+    )
+
+    if not server:
+
+        raise RuntimeError(
+            "VK upload не вернул server:\n"
+            f"{upload_res}"
+        )
+
+    if not vk_hash:
+
+        raise RuntimeError(
+            "VK upload не вернул hash:\n"
+            f"{upload_res}"
+        )
+
+    if (
+        photo is None
+        or str(photo).strip() == ""
+        or photo == "[]"
+        or photo == "undefined"
+        or str(photo).lower() == "null"
+    ):
+
+        raise RuntimeError(
+            "VK upload не вернул корректный photo.\n"
+            f"Ответ:\n{upload_res}"
+        )
+
+    # --------------------------------------------------------
+    # 3. Сохраняем фотографию VK
+    # --------------------------------------------------------
+
+    logger.info(
+        "VK: сохраняем фотографию..."
+    )
+
+    save_res = vk_call(
+        "photos.saveWallPhoto",
+        data={
+            "group_id": group_id,
+            "server": server,
+            "photo": photo,
+            "hash": vk_hash,
+            "access_token": VK_ACCESS_TOKEN.strip(),
+            "v": VK_API_VERSION
+        }
+    )
+
+    logger.info(
+        "[VK] saveWallPhoto: %s",
+        save_res
+    )
+
+    if "error" in save_res:
+
+        raise RuntimeError(
+            "VK saveWallPhoto: "
+            f"{save_res['error']}"
+        )
+
+    try:
+
+        photo_info = (
+            save_res["response"][0]
+        )
+
+        owner_id = photo_info[
+            "owner_id"
+        ]
+
+        photo_id = photo_info[
+            "id"
+        ]
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "VK не вернул данные "
+            "сохранённой фотографии:\n"
+            f"{save_res}"
+        ) from e
+
+    # --------------------------------------------------------
+    # 4. Создаём пост
+    # --------------------------------------------------------
+
+    logger.info(
+        "VK: создаём пост..."
+    )
+
+    post_res = vk_call(
+        "wall.post",
+        data={
+            "owner_id": -group_id,
+            "from_group": 1,
+            "message": wall_text,
+            "attachments": (
+                f"photo{owner_id}_{photo_id}"
+            ),
+            "access_token": VK_ACCESS_TOKEN.strip(),
+            "v": VK_API_VERSION
+        }
+    )
+
+    logger.info(
+        "[VK] wall.post: %s",
+        post_res
+    )
+
+    if "error" in post_res:
+
+        raise RuntimeError(
+            f"VK wall.post: "
+            f"{post_res['error']}"
+        )
+
+    post_id = (
+        post_res
+        ["response"]
+        ["post_id"]
+    )
+
+    # --------------------------------------------------------
+    # 5. Публикуем промпт в комментарии
+    # --------------------------------------------------------
+
+    logger.info(
+        "VK: публикуем промпт в комментарии..."
+    )
+
+    comment_res = vk_call(
+        "wall.createComment",
+        data={
+            "owner_id": -group_id,
+            "post_id": post_id,
+            "from_group": group_id,
+            "message": comment_text,
+            "access_token": VK_ACCESS_TOKEN.strip(),
+            "v": VK_API_VERSION
+        }
+    )
+
+    if "error" in comment_res:
+
+        logger.warning(
+            "VK комментарий с from_group=%s не прошёл.",
+            group_id
+        )
+
+        # Повторяем так же, как в старом рабочем скрипте.
+        comment_res = vk_call(
+            "wall.createComment",
+            data={
+                "owner_id": -group_id,
+                "post_id": post_id,
+                "from_group": 1,
+                "message": comment_text,
+                "access_token": VK_ACCESS_TOKEN.strip(),
+                "v": VK_API_VERSION
+            }
+        )
+
+    if "error" in comment_res:
+
+        raise RuntimeError(
+            "Пост VK создан, "
+            "но промпт не удалось разместить "
+            "в комментарии:\n"
+            f"{comment_res['error']}"
+        )
+
+    logger.info(
+        "VK: комментарий с промптом опубликован."
+    )
+
+    post_link = (
+        f"https://vk.com/wall-"
+        f"{group_id}_{post_id}"
+    )
+
+    logger.info(
+        "VK POST LINK: %s",
+        post_link
+    )
+
+    return post_link
+
+
+# ============================================================
+# ТЕКСТ ПОСТА VK
+# ============================================================
+
+def build_wall_post_text(
+    data: dict[str, Any]
+) -> str:
+
+    hashtags = data.get(
+        "hashtags",
+        "#нейрофото #промпт #нейросеть"
+    )
+
+    return f"""⚠️ Берешь промпт — обязательно ставь лайк ❤️ на пост и делись результатом вашей генерации в комментарии!
+
+КАК СОЗДАТЬ ФОТО С ПОМОЩЬЮ БОТОВ 🖤
+
+🔹 БОТ 1 ВК — GPTron Nano Banana Pro 🍌✅
+1️⃣ Переходим в бот:
+https://vk.com/write-236453790?ref=pp53aacd7d52
+
+🔹 БОТ 2 ВК — Lexy Nano Banana Pro 🍌✅
+Переходим в бот:
+https://vk.com/write-233546714?ref=84372609_add
+
+Отправляем своё фото.
+Выбираем модель генерации NANA BANANA PRO.
+Перед отправкой вставляем нужный промт в комментариях.
+
+❗️ Промт всегда можно и нужно менять под себя:
+цвет волос, глаз, одежду, позу, настроение и т.д.
+
+👇 Забирай готовый промпт для генерации в комментариях к этому посту!
+
+{hashtags}"""
+
+
+# ============================================================
+# ОБРАБОТКА ОДНОЙ ФОТОГРАФИИ
 # ============================================================
 
 def process_one_photo():
 
+    logger.info("")
+    logger.info("==========================================")
+    logger.info("НАЧАЛО НОВОГО ЦИКЛА")
+    logger.info("==========================================")
+
     logger.info(
-        "Проверяем Яндекс.Диск..."
+        "Папка: %s",
+        YANDEX_FOLDER
     )
+
+    # --------------------------------------------------------
+    # 1. Получаем список файлов
+    # --------------------------------------------------------
 
     files = get_yandex_files()
 
     logger.info(
-        "Файлов найдено: %s",
-        len(files),
+        "Всего объектов в папке: %s",
+        len(files)
     )
 
-    image = select_image(files)
+    image = select_one_image(
+        files
+    )
+
+    # --------------------------------------------------------
+    # Если фотографии нет
+    # --------------------------------------------------------
 
     if not image:
 
         logger.info(
-            "Фотографий для обработки нет."
+            "Фотографий для публикации нет."
         )
 
         telegram_send(
             "ℹ️ Проверка завершена\n\n"
             f"📁 Папка: {YANDEX_FOLDER}\n"
-            "📷 Новых фотографий нет."
+            "📷 Новых фотографий нет.\n\n"
+            f"⏱ Следующая проверка через "
+            f"{POST_INTERVAL_HOURS:g} часа."
         )
 
-        return
+        return False
 
-    file_name = image["name"]
-    file_path = image["path"]
+    # --------------------------------------------------------
+    # 2. Выбираем РОВНО одну фотографию
+    # --------------------------------------------------------
+
+    file_name = image[
+        "name"
+    ]
+
+    file_path = image[
+        "path"
+    ]
 
     logger.info(
-        "Найдена фотография: %s",
-        file_name,
+        "Выбрано фото: %s",
+        file_name
+    )
+
+    logger.info(
+        "За этот цикл будет обработано "
+        "ровно 1 фото."
     )
 
     telegram_send(
-        "🚀 Начинаю обработку фото\n\n"
-        f"📁 Папка: {YANDEX_FOLDER}\n"
-        f"📷 Файл: {file_name}\n\n"
+        "🚀 Начинаю обработку фотографии\n\n"
+
+        f"📷 Файл:\n"
+        f"{file_name}\n\n"
+
+        f"📁 Папка:\n"
+        f"{YANDEX_FOLDER}\n\n"
+
         "🔎 Шаг 1/4 — скачивание и анализ..."
     )
 
-    # -----------------------------------
-    # Скачивание
-    # -----------------------------------
+    # --------------------------------------------------------
+    # 3. Скачиваем фото
+    # --------------------------------------------------------
 
-    original_bytes = download_yandex_file(
-        file_path
+    original_bytes = (
+        download_yandex_file(
+            file_path
+        )
     )
 
-    # -----------------------------------
-    # Нормализация
-    # -----------------------------------
+    # --------------------------------------------------------
+    # 4. Подготавливаем изображение
+    # --------------------------------------------------------
 
     image_bytes = normalize_image(
         original_bytes
     )
 
-    # -----------------------------------
-    # Gemini
-    # -----------------------------------
+    # --------------------------------------------------------
+    # 5. Gemini анализ
+    # --------------------------------------------------------
 
-    result = analyze_image(
-        image_bytes
+    telegram_send(
+        "🔎 Шаг 2/4 — Gemini анализирует "
+        "референс..."
+    )
+
+    analysis_json = (
+        analyze_reference(
+            image_bytes
+        )
+    )
+
+    # --------------------------------------------------------
+    # 6. Создаём стандартный промпт
+    # --------------------------------------------------------
+
+    current_prompt = (
+        build_standard_prompt(
+            analysis_json
+        )
     )
 
     logger.info(
-        "Gemini анализ завершён."
+        "Стандартный промпт сформирован."
     )
 
-    # -----------------------------------
-    # Telegram
-    # -----------------------------------
+    # --------------------------------------------------------
+    # 7. Формируем пост VK
+    # --------------------------------------------------------
 
-    first_message = (
-        "✅ Фото успешно обработано\n\n"
-
-        f"📁 Файл:\n"
-        f"{file_name}\n\n"
-
-        "📌 Название:\n"
-        f"{result['summary']}\n\n"
-
-        "🔎 Анализ Gemini 3.6 завершён\n"
-        "📝 Стандартный промпт создан\n\n"
-
-        "🏷 Хэштеги:\n"
-        f"{result['hashtags']}\n\n"
-
-        "📂 Источник:\n"
-        f"{file_path}\n\n"
-
-        "🗑 Исходный файл будет удалён "
-        "после успешного завершения обработки."
+    wall_text = (
+        build_wall_post_text(
+            analysis_json
+        )
     )
+
+    # --------------------------------------------------------
+    # 8. Комментарий = ГОТОВЫЙ ПРОМПТ
+    # --------------------------------------------------------
+
+    comment_text = (
+        "📌 ПРОМПТ ДЛЯ ГЕНЕРАЦИИ\n\n"
+        + current_prompt
+    )
+
+    # --------------------------------------------------------
+    # Telegram — промежуточный статус
+    # --------------------------------------------------------
 
     telegram_send(
-        first_message
+        "✅ Gemini-анализ завершён\n"
+        "✅ Промпт сформирован\n\n"
+        "🚀 Шаг 3/4 — публикую фото в VK..."
     )
 
-    # -----------------------------------
-    # Готовый промпт
-    # -----------------------------------
+    # --------------------------------------------------------
+    # 9. Публикуем в VK
+    # --------------------------------------------------------
 
-    prompt_message = (
-        "📝 ГОТОВЫЙ ПРОМПТ\n\n"
-        "📌 Промпт для генерации:\n\n"
-        f"{result['prompt']}"
+    post_link = post_to_vk(
+        image_bytes=image_bytes,
+        wall_text=wall_text,
+        comment_text=comment_text
     )
 
-    max_length = 4000
+    # --------------------------------------------------------
+    # 10. И ТОЛЬКО ПОСЛЕ УСПЕШНОГО VK
+    #     удаляем исходник с Яндекс.Диска
+    # --------------------------------------------------------
 
-    if len(prompt_message) <= max_length:
-
-        telegram_send(
-            prompt_message
-        )
-
-    else:
-
-        telegram_send(
-            "📝 ГОТОВЫЙ ПРОМПТ\n\n"
-            "Промпт длинный, поэтому отправляю "
-            "его несколькими сообщениями."
-        )
-
-        text = result["prompt"]
-
-        for start in range(
-            0,
-            len(text),
-            max_length,
-        ):
-
-            telegram_send(
-                text[
-                    start:start + max_length
-                ]
-            )
-
-    # -----------------------------------
-    # Удаление исходника
-    # -----------------------------------
+    telegram_send(
+        "✅ VK публикация завершена\n\n"
+        f"🔗 {post_link}\n\n"
+        "🗑 Шаг 4/4 — удаляю исходник "
+        "с Яндекс.Диска..."
+    )
 
     delete_yandex_file(
         file_path
     )
 
-    logger.info(
-        "Исходный файл удалён: %s",
-        file_path,
+    # --------------------------------------------------------
+    # 11. Финальный отчёт
+    # --------------------------------------------------------
+
+    hashtags = analysis_json.get(
+        "hashtags",
+        ""
     )
 
-    telegram_send(
-        "🎉 Готово!\n\n"
+    title = analysis_json.get(
+        "photo_title",
+        "Нейрофотосессия"
+    )
 
-        f"✅ Обработано: {file_name}\n"
+    telegram_send_long(
+        "🎉 ГОТОВО!\n\n"
+
+        f"📷 Обработано:\n"
+        f"{file_name}\n\n"
+
+        f"✨ Название:\n"
+        f"{title}\n\n"
+
         "✅ Gemini-анализ создан\n"
         "✅ Промпт создан\n"
-        "✅ Исходник удалён с Яндекс.Диска\n\n"
+        "✅ Фото опубликовано в VK\n"
+        "✅ Промпт опубликован "
+        "в комментарии VK\n"
+        "✅ Ссылка на пост получена\n"
+        "✅ Исходник удалён "
+        "с Яндекс.Диска\n\n"
 
-        "📌 VK пока не используется — "
-        "сейчас проверяем VK API."
+        f"🔗 ПОСТ VK:\n"
+        f"{post_link}\n\n"
+
+        f"🏷 Хэштеги:\n"
+        f"{hashtags}"
     )
+
+    logger.info(
+        "Цикл успешно завершён."
+    )
+
+    logger.info(
+        "Пост VK: %s",
+        post_link
+    )
+
+    return True
 
 
 # ============================================================
-# MAIN
+# ОСНОВНОЙ ЦИКЛ
 # ============================================================
 
 def main():
@@ -757,58 +1785,37 @@ def main():
     check_env()
 
     # --------------------------------------------------------
-    # ПРОВЕРКА VK
-    # --------------------------------------------------------
-
-    vk_ok = test_vk()
-
-    if vk_ok:
-
-        logger.info(
-            "✅ VK: авторизация и доступ к группе работают."
-        )
-
-        telegram_send(
-            "✅ Проверка VK пройдена\n\n"
-            f"🏠 Группа ID: {VK_GROUP_ID}\n"
-            "🔑 Доступ к VK API подтверждён.\n\n"
-            "📌 Публикация пока не включена."
-        )
-
-    else:
-
-        logger.error(
-            "❌ VK: проверка не пройдена."
-        )
-
-        telegram_send(
-            "⚠️ Проверка VK не пройдена\n\n"
-            "Автоматизация Яндекс.Диск → "
-            "Gemini → Telegram продолжит работу.\n\n"
-            "📌 Публикация в VK пока отключена."
-        )
-
-    # --------------------------------------------------------
-    # ЗАПУСК АВТОМАТИЗАЦИИ
+    # Стартовое сообщение
     # --------------------------------------------------------
 
     telegram_send(
         "🚀 Автоматизация запущена\n\n"
 
-        f"📁 Папка: {YANDEX_FOLDER}\n"
-        "⏱ Интервал: 2 часа\n"
-        "📷 За один запуск: 1 фотография\n"
-        "🤖 Gemini: включён\n"
-        f"🔵 VK: {'доступ есть' if vk_ok else 'проверка не пройдена'}\n\n"
+        f"📁 Папка:\n"
+        f"{YANDEX_FOLDER}\n\n"
 
-        "⏳ Ожидаю фотографии..."
+        f"⏱ Интервал публикаций:\n"
+        f"каждые {POST_INTERVAL_HOURS:g} часа\n\n"
+
+        "📷 За один цикл:\n"
+        "ровно 1 фотография\n\n"
+
+        "🤖 Gemini:\n"
+        "включён\n\n"
+
+        "🔵 VK:\n"
+        "включён\n\n"
+
+        "📌 Первый цикл запускается сейчас."
     )
 
     # --------------------------------------------------------
-    # ОСНОВНОЙ ЦИКЛ
+    # БЕСКОНЕЧНЫЙ ЦИКЛ
     # --------------------------------------------------------
 
     while True:
+
+        cycle_start = time.time()
 
         try:
 
@@ -817,36 +1824,121 @@ def main():
         except Exception as e:
 
             logger.exception(
-                "Ошибка обработки."
+                "ОШИБКА ЦИКЛА"
+            )
+
+            error_text = (
+                "❌ ОШИБКА АВТОМАТИЗАЦИИ\n\n"
+                f"{type(e).__name__}:\n"
+                f"{e}\n\n"
+
+                "⚠️ Исходный файл "
+                "не удалён, если публикация "
+                "не завершилась успешно."
             )
 
             try:
 
                 telegram_send(
-                    "❌ Ошибка автоматизации\n\n"
-                    f"{type(e).__name__}: {e}"
+                    error_text
                 )
 
             except Exception:
 
                 logger.exception(
-                    "Не удалось отправить сообщение "
-                    "об ошибке в Telegram."
+                    "Не удалось отправить ошибку Telegram."
                 )
 
-        logger.info(
-            "Следующая проверка через 2 часа..."
+        # ----------------------------------------------------
+        # Вычисляем время до следующего запуска
+        # ----------------------------------------------------
+
+        elapsed = (
+            time.time()
+            - cycle_start
         )
 
+        sleep_seconds = max(
+            0,
+            POST_INTERVAL_SECONDS
+        )
+
+        logger.info(
+            "Цикл занял: %.1f секунд.",
+            elapsed
+        )
+
+        logger.info(
+            "Следующий запуск через %.2f часа.",
+            sleep_seconds / 3600
+        )
+
+        try:
+
+            telegram_send(
+                "⏳ Цикл завершён.\n\n"
+                f"Следующая проверка через "
+                f"{POST_INTERVAL_HOURS:g} часа."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Не удалось отправить "
+                "сообщение о следующем запуске."
+            )
+
+        # ----------------------------------------------------
+        # ВАЖНО:
+        #
+        # Отсчёт 2 часов начинается ПОСЛЕ завершения
+        # текущего цикла.
+        #
+        # То есть:
+        #
+        # публикация
+        #     ↓
+        # ожидание 2 часа
+        #     ↓
+        # следующая публикация
+        # ----------------------------------------------------
+
         time.sleep(
-            CHECK_INTERVAL
+            sleep_seconds
         )
 
 
 # ============================================================
-# START
+# ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
 
-    main()
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Бот остановлен вручную."
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Критическая ошибка запуска: %s",
+            e
+        )
+
+        try:
+
+            telegram_send(
+                "💥 КРИТИЧЕСКАЯ ОШИБКА\n\n"
+                f"{type(e).__name__}:\n"
+                f"{e}"
+            )
+
+        except Exception:
+
+            pass
