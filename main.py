@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import random
 import secrets
 import threading
 import time
@@ -70,6 +71,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TEXT_MODEL = "gemini-3.6-flash"
 
+# Резервные модели Gemini для временных ошибок 503/429/5xx.
+# Все модели ниже поддерживают входные изображения и структурированный JSON.
+GEMINI_FALLBACK_MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+]
+
 
 # ------------------------------------------------------------
 # TELEGRAM
@@ -117,7 +125,12 @@ POST_INTERVAL_SECONDS = int(
 
 TELEGRAM_MAX_LENGTH = 3900
 
-GEMINI_RETRY_DELAYS = [3, 7, 15]
+# Повторы при временных сбоях Gemini.
+# Используем увеличивающуюся задержку + небольшой jitter.
+GEMINI_RETRY_DELAYS = [30, 60, 120, 300]
+
+# Сколько попыток делать для каждой модели.
+GEMINI_ATTEMPTS_PER_MODEL = len(GEMINI_RETRY_DELAYS) + 1
 
 VK_RETRY_DELAYS = [3, 7, 15]
 
@@ -219,6 +232,12 @@ def check_env():
 
     logger.info(
         "За один цикл: 1 фотография"
+    )
+
+    logger.info(
+        "Gemini модели: %s -> %s",
+        TEXT_MODEL,
+        ", ".join(GEMINI_FALLBACK_MODELS)
     )
 
 
@@ -1457,6 +1476,49 @@ def parse_json(
 
 
 # ============================================================
+# GEMINI RETRY / FALLBACK
+# ============================================================
+
+def _is_transient_gemini_error(error: Exception) -> bool:
+    """Определяет временные ошибки Gemini, которые безопасно повторять."""
+
+    code = getattr(error, "code", None)
+
+    if code in (408, 429, 500, 502, 503, 504):
+        return True
+
+    text = str(error).upper()
+
+    transient_markers = (
+        "503",
+        "UNAVAILABLE",
+        "SERVICE_UNAVAILABLE",
+        "INTERNAL",
+        "RESOURCE_EXHAUSTED",
+        "TOO_MANY_REQUESTS",
+        "429",
+        "408",
+        "TIMEOUT",
+    )
+
+    return any(marker in text for marker in transient_markers)
+
+
+def _gemini_retry_wait(seconds: int):
+    """Ждёт перед повтором, добавляя небольшой случайный jitter."""
+
+    jitter = random.uniform(0, min(10, max(1, seconds * 0.15)))
+    total = seconds + jitter
+
+    logger.info(
+        "Gemini: ждём %.1f сек. перед повтором...",
+        total
+    )
+
+    time.sleep(total)
+
+
+# ============================================================
 # GEMINI
 # ПОДРОБНЫЙ АНАЛИЗ РЕФЕРЕНСА
 # ============================================================
@@ -1657,57 +1719,91 @@ def analyze_reference(
 
     last_error = None
 
-    for attempt in range(3):
+    # Основная модель + резервные модели.
+    # При временной перегрузке делаем несколько попыток,
+    # затем переключаемся на следующую модель.
+    models_to_try = [
+        TEXT_MODEL,
+        *GEMINI_FALLBACK_MODELS,
+    ]
 
-        try:
+    for model_index, model_name in enumerate(models_to_try):
 
-            logger.info(
-                "Gemini анализ: попытка %s/3",
-                attempt + 1
-            )
+        for attempt in range(GEMINI_ATTEMPTS_PER_MODEL):
 
-            response = client.models.generate_content(
-                model=TEXT_MODEL,
-                contents=[
-                    image_part,
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
+            try:
+
+                logger.info(
+                    "Gemini анализ: модель=%s, попытка %s/%s",
+                    model_name,
+                    attempt + 1,
+                    GEMINI_ATTEMPTS_PER_MODEL
                 )
-            )
 
-            data = parse_json(
-                response.text
-            )
-
-            logger.info(
-                "Gemini JSON анализа получен."
-            )
-
-            return data
-
-        except Exception as e:
-
-            last_error = e
-
-            logger.error(
-                "Gemini ошибка анализа: %s",
-                e
-            )
-
-            if attempt < 2:
-
-                time.sleep(
-                    GEMINI_RETRY_DELAYS[
-                        attempt
-                    ]
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        image_part,
+                        prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
                 )
+
+                data = parse_json(
+                    response.text
+                )
+
+                logger.info(
+                    "Gemini JSON анализа получен. Модель: %s",
+                    model_name
+                )
+
+                return data
+
+            except Exception as e:
+
+                last_error = e
+
+                transient = _is_transient_gemini_error(e)
+
+                logger.error(
+                    "Gemini ошибка анализа (%s): %s",
+                    "временная" if transient else "неповторяемая",
+                    e
+                )
+
+                if not transient:
+                    raise RuntimeError(
+                        "Не удалось проанализировать референс: "
+                        f"{e}"
+                    ) from e
+
+                # Если это последняя попытка текущей модели,
+                # сразу переходим к следующей модели.
+                if attempt == GEMINI_ATTEMPTS_PER_MODEL - 1:
+
+                    if model_index < len(models_to_try) - 1:
+
+                        next_model = models_to_try[model_index + 1]
+
+                        logger.warning(
+                            "Gemini: модель %s временно недоступна. "
+                            "Переключаемся на %s.",
+                            model_name,
+                            next_model
+                        )
+
+                    break
+
+                wait_seconds = GEMINI_RETRY_DELAYS[attempt]
+                _gemini_retry_wait(wait_seconds)
 
     raise RuntimeError(
-        "Не удалось проанализировать референс: "
-        f"{last_error}"
-    )
+        "Gemini временно недоступен на всех резервных моделях. "
+        f"Последняя ошибка: {last_error}"
+    ) from last_error
 
 
 # ============================================================
