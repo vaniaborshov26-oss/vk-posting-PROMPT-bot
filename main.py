@@ -1,13 +1,19 @@
+import base64
+import hashlib
 import io
 import json
 import logging
 import os
+import secrets
+import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
+from flask import Flask, redirect, request, render_template_string
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -25,6 +31,19 @@ VK_API_VERSION = "5.131"
 
 VK_GROUP_ID = os.getenv("VK_GROUP_ID")
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN")
+
+# VK ID OAuth 2.1 + PKCE
+VK_CLIENT_ID = os.getenv("VK_CLIENT_ID")
+VK_REDIRECT_URI = os.getenv(
+    "VK_REDIRECT_URI",
+    "https://bot-1789502779-5051-vania.bothost.tech/vk/callback"
+)
+
+# Запрашиваемые права пользовательского токена.
+VK_OAUTH_SCOPE = os.getenv(
+    "VK_OAUTH_SCOPE",
+    "wall,photos,groups"
+)
 
 VK_TIMEOUT = 120
 
@@ -102,6 +121,29 @@ GEMINI_RETRY_DELAYS = [3, 7, 15]
 
 VK_RETRY_DELAYS = [3, 7, 15]
 
+# Постоянное хранилище BotHost.
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+VK_TOKEN_FILE = os.path.join(
+    DATA_DIR,
+    "vk_tokens.json"
+)
+
+VK_PENDING_FILE = os.path.join(
+    DATA_DIR,
+    "vk_oauth_pending.json"
+)
+
+VK_FLASK_SECRET_FILE = os.path.join(
+    DATA_DIR,
+    "flask_secret.txt"
+)
+
+WEB_PORT = int(
+    os.getenv("PORT", "3000")
+)
+
 
 # ============================================================
 # ЛОГИ
@@ -144,6 +186,8 @@ def check_env():
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
         "VK_ACCESS_TOKEN": VK_ACCESS_TOKEN,
         "VK_GROUP_ID": VK_GROUP_ID,
+        "VK_CLIENT_ID": VK_CLIENT_ID,
+        "VK_REDIRECT_URI": VK_REDIRECT_URI,
     }
 
     missing = [
@@ -175,6 +219,925 @@ def check_env():
 
     logger.info(
         "За один цикл: 1 фотография"
+    )
+
+
+# ============================================================
+# VK ID OAUTH 2.1 + PKCE
+# ============================================================
+
+VK_ID_AUTHORIZE_URL = "https://id.vk.ru/authorize"
+VK_ID_TOKEN_URL = "https://id.vk.ru/oauth2/auth"
+
+
+def _load_or_create_flask_secret():
+    if os.path.exists(VK_FLASK_SECRET_FILE):
+
+        value = Path(
+            VK_FLASK_SECRET_FILE
+        ).read_text(
+            encoding="utf-8"
+        ).strip()
+
+        if value:
+            return value
+
+    value = secrets.token_urlsafe(48)
+
+    Path(
+        VK_FLASK_SECRET_FILE
+    ).write_text(
+        value,
+        encoding="utf-8"
+    )
+
+    return value
+
+
+app = Flask(__name__)
+app.secret_key = _load_or_create_flask_secret()
+
+
+def _save_json_file(
+    path: str,
+    data: dict
+):
+
+    temp_path = path + ".tmp"
+
+    Path(
+        temp_path
+    ).write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    os.replace(
+        temp_path,
+        path
+    )
+
+
+def _load_json_file(
+    path: str
+) -> dict:
+
+    if not os.path.exists(path):
+        return {}
+
+    try:
+
+        return json.loads(
+            Path(path).read_text(
+                encoding="utf-8"
+            )
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Не удалось прочитать JSON: %s",
+            path
+        )
+
+        return {}
+
+
+def _generate_code_verifier():
+
+    return secrets.token_urlsafe(64)
+
+
+def _generate_code_challenge(
+    code_verifier: str
+):
+
+    digest = hashlib.sha256(
+        code_verifier.encode("ascii")
+    ).digest()
+
+    return base64.urlsafe_b64encode(
+        digest
+    ).decode(
+        "ascii"
+    ).rstrip("=")
+
+
+def _save_pending_oauth(
+    state: str,
+    code_verifier: str
+):
+
+    _save_json_file(
+        VK_PENDING_FILE,
+        {
+            "state": state,
+            "code_verifier": code_verifier,
+            "created_at": time.time()
+        }
+    )
+
+
+def _load_pending_oauth():
+
+    return _load_json_file(
+        VK_PENDING_FILE
+    )
+
+
+def _clear_pending_oauth():
+
+    try:
+
+        if os.path.exists(
+            VK_PENDING_FILE
+        ):
+
+            os.remove(
+                VK_PENDING_FILE
+            )
+
+    except Exception:
+
+        logger.exception(
+            "Не удалось удалить pending OAuth."
+        )
+
+
+def _load_vk_tokens():
+
+    return _load_json_file(
+        VK_TOKEN_FILE
+    )
+
+
+def _save_vk_tokens(
+    tokens: dict
+):
+
+    _save_json_file(
+        VK_TOKEN_FILE,
+        tokens
+    )
+
+
+def vk_login_url():
+
+    # Не создаём новую OAuth-сессию при каждом обращении.
+    # Это важно, чтобы ссылка из Telegram не становилась недействительной
+    # через несколько секунд из-за нового state.
+    pending = _load_pending_oauth()
+
+    pending_created_at = float(
+        pending.get(
+            "created_at",
+            0
+        )
+    )
+
+    if (
+        pending.get("state")
+        and pending.get("code_verifier")
+        and time.time() - pending_created_at < 600
+    ):
+
+        state = pending["state"]
+        code_verifier = pending["code_verifier"]
+
+    else:
+
+        state = secrets.token_urlsafe(
+            32
+        )
+
+        code_verifier = (
+            _generate_code_verifier()
+        )
+
+        _save_pending_oauth(
+            state,
+            code_verifier
+        )
+
+    code_challenge = (
+        _generate_code_challenge(
+            code_verifier
+        )
+    )
+
+    params = {
+        "lang_id": 0,
+        "scheme": "light",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "s256",
+        "client_id": str(VK_CLIENT_ID),
+        "response_type": "code",
+        "scope": VK_OAUTH_SCOPE,
+        "state": state,
+        "sdk_type": "vkid",
+        "app_id": str(VK_CLIENT_ID),
+        "redirect_uri": VK_REDIRECT_URI,
+        "prompt": "login consent",
+    }
+
+    return (
+        VK_ID_AUTHORIZE_URL
+        + "?"
+        + urlencode(params)
+    )
+
+
+def _exchange_code_for_tokens(
+    code: str,
+    device_id: str,
+    state: str,
+    code_verifier: str
+):
+
+    params = {
+        "grant_type": "authorization_code",
+        "redirect_uri": VK_REDIRECT_URI,
+        "client_id": str(VK_CLIENT_ID),
+        "code_verifier": code_verifier,
+        "state": state,
+        "device_id": device_id,
+    }
+
+    logger.info(
+        "VK ID: обмен authorization code -> token."
+    )
+
+    response = requests.post(
+        VK_ID_TOKEN_URL
+        + "?"
+        + urlencode(params),
+        data={
+            "code": code
+        },
+        timeout=VK_TIMEOUT
+    )
+
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise RuntimeError(
+            "VK ID вернул не JSON.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text[:3000]}"
+        ) from e
+
+    if not response.ok:
+
+        raise RuntimeError(
+            "VK ID OAuth ошибка.\n"
+            f"HTTP {response.status_code}\n"
+            f"{data}"
+        )
+
+    if "error" in data:
+
+        raise RuntimeError(
+            "VK ID OAuth ошибка:\n"
+            f"{data}"
+        )
+
+    returned_state = data.get(
+        "state"
+    )
+
+    if (
+        returned_state
+        and returned_state != state
+    ):
+
+        raise RuntimeError(
+            "VK ID: state в ответе не совпадает."
+        )
+
+    if not data.get(
+        "access_token"
+    ):
+
+        raise RuntimeError(
+            "VK ID не вернул access_token:\n"
+            f"{data}"
+        )
+
+    # По документации VK ID refresh_token выдаётся вместе
+    # с access_token для дальнейшего обновления.
+    if not data.get(
+        "refresh_token"
+    ):
+
+        raise RuntimeError(
+            "VK ID не вернул refresh_token:\n"
+            f"{data}"
+        )
+
+    expires_in = int(
+        data.get(
+            "expires_in",
+            3600
+        )
+    )
+
+    tokens = {
+        "access_token": data[
+            "access_token"
+        ],
+
+        "refresh_token": data[
+            "refresh_token"
+        ],
+
+        "device_id": device_id,
+
+        "user_id": data.get(
+            "user_id"
+        ),
+
+        "scope": data.get(
+            "scope",
+            ""
+        ),
+
+        "expires_at": (
+            time.time()
+            + max(
+                60,
+                expires_in - 120
+            )
+        )
+    }
+
+    _save_vk_tokens(
+        tokens
+    )
+
+    return tokens
+
+
+def refresh_vk_user_token():
+
+    old_tokens = _load_vk_tokens()
+
+    refresh_token = old_tokens.get(
+        "refresh_token"
+    )
+
+    device_id = old_tokens.get(
+        "device_id"
+    )
+
+    if not refresh_token:
+
+        raise RuntimeError(
+            "VK refresh_token отсутствует. "
+            "Нужно пройти /vk/login."
+        )
+
+    if not device_id:
+
+        raise RuntimeError(
+            "VK device_id отсутствует. "
+            "Нужно повторно пройти авторизацию."
+        )
+
+    refresh_state = secrets.token_urlsafe(
+        32
+    )
+
+    params = {
+        "grant_type": "refresh_token",
+        "redirect_uri": VK_REDIRECT_URI,
+        "client_id": str(VK_CLIENT_ID),
+        "device_id": device_id,
+        "state": refresh_state,
+    }
+
+    logger.info(
+        "VK ID: обновляем access token..."
+    )
+
+    response = requests.post(
+        VK_ID_TOKEN_URL
+        + "?"
+        + urlencode(params),
+        data={
+            "refresh_token": refresh_token
+        },
+        timeout=VK_TIMEOUT
+    )
+
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise RuntimeError(
+            "VK ID refresh вернул не JSON.\n"
+            f"HTTP {response.status_code}\n"
+            f"{response.text[:3000]}"
+        ) from e
+
+    if not response.ok:
+
+        raise RuntimeError(
+            "VK ID refresh ошибка.\n"
+            f"HTTP {response.status_code}\n"
+            f"{data}"
+        )
+
+    if "error" in data:
+
+        raise RuntimeError(
+            "VK ID refresh ошибка:\n"
+            f"{data}"
+        )
+
+    returned_state = data.get(
+        "state"
+    )
+
+    if (
+        returned_state
+        and returned_state != refresh_state
+    ):
+
+        raise RuntimeError(
+            "VK ID refresh: state не совпадает."
+        )
+
+    if not data.get(
+        "access_token"
+    ):
+
+        raise RuntimeError(
+            "VK ID refresh не вернул access_token:\n"
+            f"{data}"
+        )
+
+    expires_in = int(
+        data.get(
+            "expires_in",
+            3600
+        )
+    )
+
+    new_tokens = dict(
+        old_tokens
+    )
+
+    new_tokens[
+        "access_token"
+    ] = data[
+        "access_token"
+    ]
+
+    if data.get(
+        "refresh_token"
+    ):
+
+        new_tokens[
+            "refresh_token"
+        ] = data[
+            "refresh_token"
+        ]
+
+    if data.get(
+        "device_id"
+    ):
+
+        new_tokens[
+            "device_id"
+        ] = data[
+            "device_id"
+        ]
+
+    if data.get(
+        "user_id"
+    ):
+
+        new_tokens[
+            "user_id"
+        ] = data[
+            "user_id"
+        ]
+
+    if data.get(
+        "scope"
+    ):
+
+        new_tokens[
+            "scope"
+        ] = data[
+            "scope"
+        ]
+
+    new_tokens[
+        "expires_at"
+    ] = (
+        time.time()
+        + max(
+            60,
+            expires_in - 120
+        )
+    )
+
+    _save_vk_tokens(
+        new_tokens
+    )
+
+    logger.info(
+        "VK ID: access token обновлён."
+    )
+
+    return new_tokens
+
+
+_vk_refresh_lock = threading.Lock()
+
+
+def get_vk_user_access_token(
+    force_refresh: bool = False
+):
+
+    tokens = _load_vk_tokens()
+
+    access_token = tokens.get(
+        "access_token"
+    )
+
+    expires_at = float(
+        tokens.get(
+            "expires_at",
+            0
+        )
+    )
+
+    if (
+        not force_refresh
+        and access_token
+        and time.time() < expires_at
+    ):
+
+        return access_token
+
+    with _vk_refresh_lock:
+
+        tokens = _load_vk_tokens()
+
+        access_token = tokens.get(
+            "access_token"
+        )
+
+        expires_at = float(
+            tokens.get(
+                "expires_at",
+                0
+            )
+        )
+
+        if (
+            not force_refresh
+            and access_token
+            and time.time() < expires_at
+        ):
+
+            return access_token
+
+        refreshed = refresh_vk_user_token()
+
+        return refreshed[
+            "access_token"
+        ]
+
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
+def home_route():
+
+    tokens = _load_vk_tokens()
+
+    authenticated = bool(
+        tokens.get("refresh_token")
+    )
+
+    return render_template_string(
+        """
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>NEURO Photo Automation</title>
+        </head>
+        <body style="font-family:Arial;padding:40px;line-height:1.6">
+            <h1>NEURO Photo Automation</h1>
+
+            <p>
+                VK ID:
+                {% if authenticated %}
+                ✅ пользователь авторизован
+                {% else %}
+                ❌ пользователь не авторизован
+                {% endif %}
+            </p>
+
+            <p>
+                <a href="/vk/login">
+                    🔐 Авторизоваться через VK ID
+                </a>
+            </p>
+        </body>
+        </html>
+        """,
+        authenticated=authenticated
+    )
+
+
+@app.route(
+    "/vk/login",
+    methods=["GET"]
+)
+def vk_login_route():
+
+    try:
+
+        if not VK_CLIENT_ID:
+
+            return (
+                "VK_CLIENT_ID не задан.",
+                500
+            )
+
+        return redirect(
+            vk_login_url()
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Ошибка /vk/login"
+        )
+
+        return (
+            f"<h2>Ошибка VK ID</h2><pre>{e}</pre>",
+            500
+        )
+
+
+@app.route(
+    "/vk/callback",
+    methods=["GET"]
+)
+def vk_callback_route():
+
+    error = request.args.get(
+        "error"
+    )
+
+    if error:
+
+        description = request.args.get(
+            "error_description",
+            error
+        )
+
+        return render_template_string(
+            """
+            <html>
+            <body style="font-family:Arial;padding:40px">
+                <h2>❌ VK ID: авторизация не завершена</h2>
+                <p>{{ description }}</p>
+                <p><a href="/vk/login">Попробовать ещё раз</a></p>
+            </body>
+            </html>
+            """,
+            description=description
+        ), 400
+
+    code = request.args.get(
+        "code"
+    )
+
+    state = request.args.get(
+        "state"
+    )
+
+    device_id = request.args.get(
+        "device_id"
+    )
+
+    response_type = request.args.get(
+        "type"
+    )
+
+    if not code:
+
+        return (
+            "VK ID не передал code.",
+            400
+        )
+
+    if not state:
+
+        return (
+            "VK ID не передал state.",
+            400
+        )
+
+    if not device_id:
+
+        return (
+            "VK ID не передал device_id.",
+            400
+        )
+
+    pending = _load_pending_oauth()
+
+    expected_state = pending.get(
+        "state"
+    )
+
+    code_verifier = pending.get(
+        "code_verifier"
+    )
+
+    if not expected_state:
+
+        return (
+            "Сессия авторизации не найдена. "
+            "Откройте /vk/login ещё раз.",
+            400
+        )
+
+    if state != expected_state:
+
+        logger.error(
+            "VK ID state mismatch."
+        )
+
+        return (
+            "VK ID: state mismatch.",
+            400
+        )
+
+    if not code_verifier:
+
+        return (
+            "code_verifier не найден.",
+            400
+        )
+
+    if response_type not in (
+        None,
+        "",
+        "code_v2"
+    ):
+
+        logger.warning(
+            "VK ID вернул неожиданный type=%s",
+            response_type
+        )
+
+    try:
+
+        tokens = _exchange_code_for_tokens(
+            code=code,
+            device_id=device_id,
+            state=state,
+            code_verifier=code_verifier
+        )
+
+        _clear_pending_oauth()
+
+        logger.info(
+            "VK ID: пользовательская авторизация завершена."
+        )
+
+        try:
+
+            telegram_send(
+                "✅ VK ID авторизация завершена!\n\n"
+                f"👤 VK user ID: "
+                f"{tokens.get('user_id', '—')}\n"
+                f"🔐 Права: "
+                f"{tokens.get('scope', '—')}\n\n"
+                "✅ Access token получен\n"
+                "✅ Refresh token получен\n"
+                "✅ Токены сохранены на BotHost\n\n"
+                "Теперь можно загружать фото в VK."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Не удалось отправить Telegram OAuth уведомление."
+            )
+
+        return render_template_string(
+            """
+            <html>
+            <body style="font-family:Arial;padding:40px;line-height:1.6">
+                <h2>✅ VK ID авторизация успешна</h2>
+                <p>Пользовательский токен получен.</p>
+                <p>Токены сохранены на BotHost.</p>
+                <p>Теперь эту страницу можно закрыть.</p>
+                <hr>
+                <p><b>User ID:</b> {{ user_id }}</p>
+                <p><b>Scope:</b> {{ scope }}</p>
+            </body>
+            </html>
+            """,
+            user_id=tokens.get(
+                "user_id",
+                "—"
+            ),
+            scope=tokens.get(
+                "scope",
+                "—"
+            )
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "VK ID callback error."
+        )
+
+        return render_template_string(
+            """
+            <html>
+            <body style="font-family:Arial;padding:40px;line-height:1.6">
+                <h2>❌ Ошибка авторизации VK ID</h2>
+                <pre>{{ error }}</pre>
+                <p><a href="/vk/login">Попробовать ещё раз</a></p>
+            </body>
+            </html>
+            """,
+            error=str(e)
+        ), 500
+
+
+def start_web_server():
+
+    logger.info(
+        "VK ID web server: 0.0.0.0:%s",
+        WEB_PORT
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=WEB_PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
+
+
+def ensure_vk_user_auth():
+
+    tokens = _load_vk_tokens()
+
+    if tokens.get(
+        "refresh_token"
+    ):
+
+        try:
+
+            return get_vk_user_access_token()
+
+        except Exception as e:
+
+            logger.warning(
+                "VK user token refresh failed: %s",
+                e
+            )
+
+    login_url = vk_login_url()
+
+    try:
+
+        telegram_send(
+            "🔐 Требуется авторизация VK ID\n\n"
+            "Открой ссылку в браузере:\n"
+            f"{login_url}\n\n"
+            "После авторизации токен будет храниться "
+            "на BotHost и обновляться автоматически."
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Не удалось отправить ссылку VK ID в Telegram."
+        )
+
+    raise RuntimeError(
+        "Требуется VK ID авторизация. "
+        f"Откройте: {login_url}"
     )
 
 
@@ -1232,21 +2195,52 @@ def post_to_vk(
         "VK: получаем upload server..."
     )
 
+    user_token = get_vk_user_access_token()
+
     server_res = vk_call(
         "photos.getWallUploadServer",
         params={
             "group_id": group_id,
-            "access_token": VK_ACCESS_TOKEN.strip(),
+            "access_token": user_token.strip(),
             "v": VK_API_VERSION
         }
     )
 
     if "error" in server_res:
 
-        raise RuntimeError(
-            "VK getWallUploadServer: "
-            f"{server_res['error']}"
+        error_code = server_res["error"].get(
+            "error_code"
         )
+
+        # Если токен внезапно стал недействительным,
+        # пробуем обновить его через refresh_token один раз.
+        if error_code in (5, 7, 15):
+
+            logger.warning(
+                "VK user token rejected (error %s). "
+                "Пробуем обновить token.",
+                error_code
+            )
+
+            user_token = get_vk_user_access_token(
+                force_refresh=True
+            )
+
+            server_res = vk_call(
+                "photos.getWallUploadServer",
+                params={
+                    "group_id": group_id,
+                    "access_token": user_token.strip(),
+                    "v": VK_API_VERSION
+                }
+            )
+
+        if "error" in server_res:
+
+            raise RuntimeError(
+                "VK getWallUploadServer: "
+                f"{server_res['error']}"
+            )
 
     if (
         "response" not in server_res
@@ -1356,7 +2350,7 @@ def post_to_vk(
             "server": server,
             "photo": photo,
             "hash": vk_hash,
-            "access_token": VK_ACCESS_TOKEN.strip(),
+            "access_token": user_token.strip(),
             "v": VK_API_VERSION
         }
     )
@@ -1611,6 +2605,30 @@ def process_one_photo():
         "ровно 1 фото."
     )
 
+    # До запуска Gemini проверяем, что VK ID user token готов.
+    # Если авторизации нет, фото остаётся на Яндекс.Диске.
+    try:
+
+        ensure_vk_user_auth()
+
+    except Exception as e:
+
+        logger.warning(
+            "VK ID user auth не готов: %s",
+            e
+        )
+
+        telegram_send(
+            "⏸ Публикация отложена\n\n"
+            f"📷 Файл: {file_name}\n"
+            "🔐 Требуется авторизация VK ID.\n\n"
+            "Фото НЕ удалено с Яндекс.Диска.\n\n"
+            "🔗 Открой ссылку для авторизации:\n"
+            f"{vk_login_url()}"
+        )
+
+        return False
+
     telegram_send(
         "🚀 Начинаю обработку фотографии\n\n"
 
@@ -1785,6 +2803,18 @@ def main():
     check_env()
 
     # --------------------------------------------------------
+    # WEB SERVER VK ID
+    # --------------------------------------------------------
+
+    web_thread = threading.Thread(
+        target=start_web_server,
+        name="vk-web-server",
+        daemon=True
+    )
+
+    web_thread.start()
+
+    # --------------------------------------------------------
     # Стартовое сообщение
     # --------------------------------------------------------
 
@@ -1808,6 +2838,19 @@ def main():
 
         "📌 Первый цикл запускается сейчас."
     )
+
+    # Если user authorization ещё отсутствует,
+    # отправляем ссылку сразу, но бот не останавливаем.
+    try:
+
+        ensure_vk_user_auth()
+
+    except Exception as e:
+
+        logger.warning(
+            "VK ID user authorization ещё не выполнена: %s",
+            e
+        )
 
     # --------------------------------------------------------
     # БЕСКОНЕЧНЫЙ ЦИКЛ
