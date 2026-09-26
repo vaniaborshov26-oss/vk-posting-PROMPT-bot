@@ -118,29 +118,7 @@ def send_long(chat_id, text):
         bot.send_message(chat_id, (f"Часть {i}/{len(parts)}\n\n" if len(parts) > 1 else "") + part)
 
 
-ANALYSIS_SCHEMA = r'''
-{
-  "photo_title": "",
-  "composition": {"aspect_ratio":"","shot_type":"","framing":"","camera_angle":"","subject_position":"","perspective":""},
-  "subject": {"count":0,"description":"","position":"","scale_in_frame":""},
-  "face_and_expression": {"head_position":"","gaze":"","expression":"","makeup":"","skin":""},
-  "hair": {"color":"","length":"","style":"","details":""},
-  "outfit": {"description":"","colors":"","materials":"","shoes":"","accessories":""},
-  "pose": {"body":"","head":"","left_arm":"","right_arm":"","left_hand":"","right_hand":"","legs":"","feet":""},
-  "environment": {"location":"","background":"","foreground":"","objects":""},
-  "lighting": {"type":"","source":"","direction":"","hardness":"","shadows":"","rim_light":""},
-  "camera": {"camera_type":"","lens":"","aperture":"","iso":"","shutter_speed":"","depth_of_field":""},
-  "color": {"palette":"","grading":"","contrast":"","saturation":"","white_balance":""},
-  "text_in_image": {"present":false,"language":"","content":"","position":"","style":""},
-  "style":"",
-  "quality":"",
-  "hashtags":""
-}
-'''
-
-
-def analyze(data, ratio):
-    prompt = f"""
+ANALYSIS_PROMPT = """
 Ты — профессиональный аналитик изображений
 и prompt engineer.
 
@@ -380,73 +358,39 @@ def build_standard_prompt(data):
 """.strip()
 
 
-def build_vk_post(a):
-    title = v(a, "photo_title", default="Нейрофотосессия")
-    tags = hashtags(v(a, "hashtags", default="#нейрофото #промпт #нейросеть"))
-    return f"""⚠️Берешь промпт — обязательно ставь лайк ❤️ на пост и делись результатом вашей генерации в комментарии!
+# ============================================================
+# TELEGRAM
+# ============================================================
 
-КАК СОЗДАТЬ ФОТО С ПОМОЩЬЮ БОТОВ 🖤
+def telegram_send_message(text):
 
-🔹 БОТ 1 ВК — GPTron Nano Banana Pro 🍌✅
-1️⃣ Переходим в бот:
-https://vk.com/write-236453790?ref=pp53aacd7d52
+    url = (
+        "https://api.telegram.org/"
+        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
-🔹 БОТ 2 ВК — Lexy Nano Banana Pro 🍌✅
-Переходим в бот:
-https://vk.com/write-233546714?ref=84372609_add
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
 
-Отправляем своё фото.
-Выбираем модель генерации NANA BANANA PRO
-Перед отправкой вставляем нужный промт в комментариях.
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=HTTP_TIMEOUT
+    )
 
-❗️ Промт всегда можно и нужно менять под себя:
-цвет волос, глаз, одежду, позу, настроение и т.д.
+    response.raise_for_status()
 
-👇 Забирай готовый промпт для генерации в комментариях к этому посту!
+    data = response.json()
 
-{tags}"""
-
-
-def build_vk_comment(prompt):
-    return "[📌](https://vk.ru/emoji/e/f09f938c.png) Промпт для генерации:\n\n" + prompt
-
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.reply_to(message, "👋 Привет!\n\nОтправь фото. Я проанализирую референс и пришлю:\n✅ готовый текст поста VK\n✅ готовый промпт для комментария\n\nФото и публикацию в VK ты размещаешь сам.")
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error: {data}"
+        )
 
 
-@bot.message_handler(content_types=["photo", "document"])
-def handle_photo(message):
-    status = bot.reply_to(message, "⏳ Получил фото. Начинаю подробный анализ...")
-    try:
-        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-        file_info = bot.get_file(file_id)
-        original = bot.download_file(file_info.file_path)
-        ratio = aspect_ratio(original)
-        ref = normalize_image(original)
-
-        analysis = analyze(ref, ratio)
-        prompt = build_prompt(analysis)
-        post = build_vk_post(analysis)
-        comment = build_vk_comment(prompt)
-        title = v(analysis, "photo_title", default="Нейрофотосессия")
-
-        bot.edit_message_text("✅ Анализ завершён. Отправляю готовые материалы...", message.chat.id, status.message_id)
-        bot.send_message(message.chat.id, f"✅ Готово!\n\n📌 {title}\n\nФото публикуешь сам вручную.")
-        send_long(message.chat.id, "📝 ГОТОВЫЙ ТЕКСТ ПОСТА VK\n\n" + post)
-        send_long(message.chat.id, "💬 ГОТОВЫЙ КОММЕНТАРИЙ VK\n\n" + comment)
-        bot.edit_message_text("🎉 Готово!\n\n✅ Фото проанализировано\n✅ Промпт создан\n✅ Текст поста создан\n✅ Комментарий создан\n\n📌 Теперь бери фото и эти тексты и публикуй их вручную в группе VK.", message.chat.id, status.message_id)
-
-    except Exception as e:
-        print("\n========== ERROR ==========")
-        print(str(e))
-        traceback.print_exc()
-        print("===========================\n")
-        try:
-            bot.edit_message_text(f"❌ Произошла ошибка:\n\n{e}", message.chat.id, status.message_id)
-        except Exception:
-            bot.reply_to(message, f"❌ Произошла ошибка:\n\n{e}")
 
 
 if __name__ == "__main__":
