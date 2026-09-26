@@ -1,4 +1,3 @@
-google-genai
-requests
+pyTelegramBotAPI
 Pillow
-Flask
+google-genai
