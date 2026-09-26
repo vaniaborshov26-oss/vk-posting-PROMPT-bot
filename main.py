@@ -141,69 +141,243 @@ ANALYSIS_SCHEMA = r'''
 
 def analyze(data, ratio):
     prompt = f"""
-Ты — профессиональный visual analyst и prompt engineer.
-Проанализируй ИМЕННО прикреплённое фото максимально подробно. Не придумывай отсутствующие детали.
-Главная задача — восстановить максимально точное описание того, что уже находится в референсе. Текст промпта на русском языке.
+Ты — профессиональный аналитик изображений
+и prompt engineer.
 
-КРИТИЧЕСКИ ВАЖНО: параметры камеры и съёмки определяй ИНДИВИДУАЛЬНО ПО ЭТОЙ ФОТОГРАФИИ.
-Не используй универсальные значения. Проанализируй визуальный результат и укажи наиболее вероятные
-тип камеры, объектив/фокусное расстояние, диафрагму, ISO, выдержку и глубину резкости.
-Если значение нельзя определить точно, укажи вероятное предположение.
-Фактическое соотношение сторон файла: {ratio}.
+Проанализируй прикреплённое изображение максимально подробно.
 
-Анализируй: композицию, кадрирование, план, ракурс, положение и масштаб объекта, перспективу,
-голову, взгляд, выражение, волосы, макияж, кожу, одежду, материалы, обувь, аксессуары,
-корпус, руки, кисти, пальцы, ноги, стопы, фон, передний план, предметы, свет, направление света,
-жёсткость, тени, контровой свет, глубину резкости, палитру, цветокоррекцию, контраст,
-насыщенность, баланс белого, атмосферу, стиль и весь текст/логотипы на изображении.
+Главная задача:
+описать именно то, что находится на фотографии,
+чтобы другой генератор изображения мог
+максимально точно воспроизвести сцену.
 
-Верни ТОЛЬКО JSON следующей структуры:
-{ANALYSIS_SCHEMA}
+Не придумывай элементов,
+которых нет на изображении.
+
+Особенно подробно проанализируй:
+
+- сюжет;
+- главный объект;
+- количество людей;
+- положение человека в кадре;
+- кадрирование;
+- ракурс;
+- перспективу;
+- позу;
+- положение головы;
+- направление взгляда;
+- руки и пальцы;
+- ноги;
+- волосы;
+- выражение лица;
+- одежду;
+- обувь;
+- аксессуары;
+- фон;
+- предметы;
+- освещение;
+- направление света;
+- тени;
+- глубину резкости;
+- цветовую палитру;
+- цветокоррекцию;
+- визуальный стиль;
+- предполагаемую камеру;
+- объектив;
+- предполагаемые параметры съёмки;
+
+
+Если точные параметры камеры неизвестны,
+укажи реалистичные предположения.
+
+Если на изображении есть текст,
+обязательно опиши его.
+
+Верни строго JSON.
+
+Структура:
+
+{
+  "photo_title": "",
+  "photo_style": "",
+  "camera_and_settings": "",
+  "shot_type_and_pose_intro": "",
+  "hairstyle_and_makeup": "",
+  "outfit": "",
+  "pose_details": "",
+  "lighting": "",
+  "background": "",
+  "color_grading_and_style": "",
+  "quality_and_style_tags": "",
+  "hashtags": "",
+  "text_in_image": ""
+}
 """
-    part = types.Part.from_bytes(data=data, mime_type=mime(data))
-    last = None
-    for attempt in range(MAX_ANALYSIS_ATTEMPTS):
+
+
+def analyze_photo(image_bytes):
+
+    last_error = None
+
+    mime_type = "image/jpeg"
+
+    image_part = types.Part.from_bytes(
+        data=image_bytes,
+        mime_type=mime_type
+    )
+
+    for attempt in range(
+        GEMINI_RETRIES
+    ):
+
         try:
-            print(f"[GEMINI] Анализ {attempt+1}/{MAX_ANALYSIS_ATTEMPTS}")
-            response = client.models.generate_content(
-                model=TEXT_MODEL,
-                contents=[part, prompt],
-                config=types.GenerateContentConfig(response_mime_type="application/json")
+
+            logger.info(
+                "Gemini: анализ "
+                "попытка %s/%s",
+                attempt + 1,
+                GEMINI_RETRIES
             )
-            result = parse_json(response.text)
-            result.setdefault("composition", {})["aspect_ratio"] = ratio
+
+            response = (
+                gemini.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[
+                        image_part,
+                        ANALYSIS_PROMPT
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type=(
+                            "application/json"
+                        )
+                    )
+                )
+            )
+
+            raw = (
+                response.text or ""
+            ).strip()
+
+            if not raw:
+                raise RuntimeError(
+                    "Gemini вернул пустой ответ."
+                )
+
+            # Если вдруг модель добавила markdown
+            if raw.startswith("```"):
+
+                lines = raw.splitlines()
+
+                if (
+                    lines
+                    and lines[0].startswith("```")
+                ):
+                    lines = lines[1:]
+
+                if (
+                    lines
+                    and lines[-1].strip() == "```"
+                ):
+                    lines = lines[:-1]
+
+                raw = "\n".join(
+                    lines
+                ).strip()
+
+            result = json.loads(
+                raw
+            )
+
+            logger.info(
+                "Gemini: анализ успешно получен."
+            )
+
             return result
+
         except Exception as e:
-            last = e
-            print("[GEMINI] Ошибка:", e)
-            if attempt < MAX_ANALYSIS_ATTEMPTS - 1:
-                time.sleep(RETRY_DELAYS[attempt])
-    raise RuntimeError(f"Не удалось проанализировать референс: {last}")
+
+            last_error = e
+
+            logger.exception(
+                "Ошибка Gemini"
+            )
+
+            if attempt < (
+                GEMINI_RETRIES - 1
+            ):
+
+                time.sleep(
+                    RETRY_DELAYS[attempt]
+                )
+
+    raise RuntimeError(
+        "Gemini не смог обработать "
+        f"изображение: {last_error}"
+    )
 
 
-def build_prompt(a):
-    c, s, f, h, o, p, e, l, cam, col, txt = [a.get(k, {}) for k in (
-        "composition","subject","face_and_expression","hair","outfit","pose","environment","lighting","camera","color","text_in_image")]
-    return f"""Внешность должна полностью соответствовать прикреплённому референсу: идентичные черты лица, возраст, рост, форма лица, цвет глаз, цвет и длина волос, причёска, телосложение, пропорции, макияж, выражение лица и общее визуальное впечатление.
+# ============================================================
+# STANDARD PROMPT
+# ============================================================
 
-Любые изменения внешности, стилизация под другого человека или искажение типажа недопустимы.
+def build_standard_prompt(data):
 
-Стиль: {v(a,'style')}
-Камера и параметры: {v(cam,'camera_type')}, {v(cam,'lens')}, {v(cam,'aperture')}, {v(cam,'shutter_speed')}, ISO {v(cam,'iso')}, глубина резкости: {v(cam,'depth_of_field')}
-{v(c,'shot_type')}, {v(c,'aspect_ratio')} кадр, {v(c,'camera_angle')}. {v(s,'description')} Положение: {v(s,'position')}. Перспектива: {v(c,'perspective')}.
-Причёска, кожа и макияж: волосы {v(h,'color')}, {v(h,'length')}, укладка {v(h,'style')}. Детали: {v(h,'details')}. Кожа: {v(f,'skin')}. Макияж: {v(f,'makeup')}.
-Образ: {v(o,'description')}. Цвета: {v(o,'colors')}. Материалы: {v(o,'materials')}. Обувь: {v(o,'shoes')}. Аксессуары: {v(o,'accessories')}.
-Поза: корпус — {v(p,'body')}; голова — {v(p,'head')}; левая рука — {v(p,'left_arm')}; правая рука — {v(p,'right_arm')}; левая кисть — {v(p,'left_hand')}; правая кисть — {v(p,'right_hand')}; ноги — {v(p,'legs')}; стопы — {v(p,'feet')}.
-Освещение: {v(l,'type')}. Источник: {v(l,'source')}. Направление: {v(l,'direction')}. Жёсткость: {v(l,'hardness')}. Тени: {v(l,'shadows')}. Контровой свет: {v(l,'rim_light')}.
-Фон: {v(e,'location')}; фон — {v(e,'background')}; передний план — {v(e,'foreground')}; предметы — {v(e,'objects')}.
-Цветокор: {v(col,'palette')}; грейдинг — {v(col,'grading')}; контраст — {v(col,'contrast')}; насыщенность — {v(col,'saturation')}; баланс белого — {v(col,'white_balance')}.
-Текст на изображении: {v(txt,'content')} ({v(txt,'position')}).
+    return f"""📌 Промпт для генерации:
 
-Качество и реализм:
-Максимальный фотореализм. Высокая детализация. Естественная анатомия. Реалистичная кожа. Натуральная текстура кожи. Реалистичные волосы. Реалистичные глаза. Естественный свет. Реалистичные тени.
+Внешность должна полностью соответствовать
+прикреплённому референсу:
+идентичные черты лица, возраст, рост,
+форма лица, цвет глаз, цвет и длина волос,
+причёска, телосложение, пропорции, макияж,
+выражение лица и общее визуальное впечатление.
 
-Негативный промпт:
-Без CGI. Без мультяшности. Без пластиковой кожи. Без деформаций. Без лишних пальцев. Без лишних конечностей. Без анатомических ошибок.""".strip()
+Любые изменения внешности,
+стилизация под другого человека
+или искажение типажа недопустимы.
+
+Сюжет:
+{data.get("photo_title", "")}
+
+Стиль:
+{data.get("photo_style", "")}
+
+Камера и параметры:
+{data.get("camera_and_settings", "")}
+
+Ракурс и положение:
+{data.get("shot_type_and_pose_intro", "")}
+
+Причёска и макияж:
+{data.get("hairstyle_and_makeup", "")}
+
+Одежда:
+{data.get("outfit", "")}
+
+Поза:
+{data.get("pose_details", "")}
+
+Освещение:
+{data.get("lighting", "")}
+
+Фон:
+{data.get("background", "")}
+
+Цветокоррекция:
+{data.get("color_grading_and_style", "")}
+
+Текст на изображении:
+{data.get("text_in_image", "")}
+
+Качество:
+{data.get(
+    "quality_and_style_tags",
+    "Максимальный фотореализм, "
+    "высокая детализация, естественная "
+    "анатомия, реалистичная кожа, "
+    "без CGI, без мультяшности, "
+    "без артефактов."
+)}
+""".strip()
 
 
 def build_vk_post(a):
