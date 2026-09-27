@@ -349,6 +349,15 @@ def analyze_reference(image_bytes):
 
 Верни ТОЛЬКО JSON.
 
+ЯЗЫК:
+Все текстовые значения JSON ОБЯЗАТЕЛЬНО пиши на русском языке.
+Не используй английские описания стиля, одежды, освещения, композиции
+или параметров съёмки. Например, вместо fashion/lifestyle пиши
+«фэшн/лайфстайл», вместо golden hour — «золотой час»,
+вместо full-frame — «полнокадровая камера».
+Допустимы только технические обозначения и названия брендов/моделей,
+которые естественно остаются латиницей: ISO, f/1.8, 85 мм, Sony и т.п.
+
 Структура:
 
 {{
@@ -500,6 +509,10 @@ def analyze_reference(image_bytes):
 # ============================================================
 
 def build_standard_prompt(data):
+    """
+    Формирует финальный промпт строго в формате ранее опубликованных
+    пользователем постов. Все описательные части — на русском языке.
+    """
 
     composition = data.get("composition", {})
     subject = data.get("subject", {})
@@ -513,42 +526,116 @@ def build_standard_prompt(data):
     color = data.get("color", {})
     text_info = data.get("text_in_image", {})
 
+    # --------------------------------------------------------
+    # Важно: значения поступают из анализа конкретного фото.
+    # Никаких универсальных параметров камеры здесь нет.
+    # --------------------------------------------------------
+
+    camera_text = (
+        f"{safe_value(camera, 'camera_type')}, "
+        f"объектив {safe_value(camera, 'lens')}, "
+        f"{safe_value(camera, 'aperture')}, "
+        f"ISO {safe_value(camera, 'iso')}, "
+        f"выдержка {safe_value(camera, 'shutter_speed')}, "
+        f"глубина резкости — {safe_value(camera, 'depth_of_field')}"
+    ).replace("объектив ,", "").replace(", ,", ", ")
+
+    shot_text = (
+        f"{safe_value(composition, 'shot_type')}, "
+        f"вертикальный/горизонтальный кадр {safe_value(composition, 'aspect_ratio')}, "
+        f"{safe_value(composition, 'camera_angle')}. "
+        f"{safe_value(subject, 'description')} "
+        f"Положение в кадре: {safe_value(subject, 'position')}. "
+        f"Размер в кадре: {safe_value(subject, 'scale_in_frame')}. "
+        f"Перспектива: {safe_value(composition, 'perspective')}."
+    )
+
+    hairstyle_text = (
+        f"Волосы {safe_value(hair, 'color')}, {safe_value(hair, 'length')}, "
+        f"укладка {safe_value(hair, 'style')}. "
+        f"Детали волос: {safe_value(hair, 'details')}. "
+        f"Кожа: {safe_value(face, 'skin')}. "
+        f"Макияж: {safe_value(face, 'makeup')}."
+    )
+
+    outfit_text = (
+        f"{safe_value(outfit, 'description')}. "
+        f"Цвета: {safe_value(outfit, 'colors')}. "
+        f"Материалы и фактуры: {safe_value(outfit, 'materials')}. "
+        f"Обувь: {safe_value(outfit, 'shoes')}. "
+        f"Аксессуары: {safe_value(outfit, 'accessories')}."
+    )
+
+    pose_text = (
+        f"Корпус — {safe_value(pose, 'body')}; "
+        f"голова — {safe_value(pose, 'head')}; "
+        f"левая рука — {safe_value(pose, 'left_arm')}; "
+        f"правая рука — {safe_value(pose, 'right_arm')}; "
+        f"левая кисть — {safe_value(pose, 'left_hand')}; "
+        f"правая кисть — {safe_value(pose, 'right_hand')}; "
+        f"ноги — {safe_value(pose, 'legs')}; "
+        f"стопы — {safe_value(pose, 'feet')}."
+    )
+
+    lighting_text = (
+        f"{safe_value(lighting, 'type')}. "
+        f"Источник: {safe_value(lighting, 'source')}. "
+        f"Направление: {safe_value(lighting, 'direction')}. "
+        f"Жёсткость: {safe_value(lighting, 'hardness')}. "
+        f"Тени: {safe_value(lighting, 'shadows')}. "
+        f"Контровой свет: {safe_value(lighting, 'rim_light')}."
+    )
+
+    background_text = (
+        f"Локация: {safe_value(environment, 'location')}. "
+        f"Фон: {safe_value(environment, 'background')}. "
+        f"Передний план: {safe_value(environment, 'foreground')}. "
+        f"Предметы: {safe_value(environment, 'objects')}."
+    )
+
+    color_text = (
+        f"Палитра: {safe_value(color, 'palette')}. "
+        f"Грейдинг: {safe_value(color, 'grading')}. "
+        f"Контраст: {safe_value(color, 'contrast')}. "
+        f"Насыщенность: {safe_value(color, 'saturation')}. "
+        f"Баланс белого: {safe_value(color, 'white_balance')}."
+    )
+
+    text_block = ""
+    if safe_value(text_info, "present", default=False):
+        text_block = (
+            f"Текст на изображении: {safe_value(text_info, 'content')}. "
+            f"Язык: {safe_value(text_info, 'language')}. "
+            f"Положение: {safe_value(text_info, 'position')}. "
+            f"Оформление: {safe_value(text_info, 'style')}.\n\n"
+        )
+
     prompt = f"""[📌](https://vk.ru/emoji/e/f09f938c.png) Промпт для генерации:
 
 Внешность должна полностью соответствовать прикреплённому референсу: идентичные черты лица, возраст, рост, форма лица, цвет глаз, цвет и длина волос, причёска, телосложение, пропорции, макияж, выражение лица и общее визуальное впечатление.
 
 Любые изменения внешности, стилизация под другого человека или искажение типажа недопустимы.
 
-Стиль: {safe_value(data, "style")}
+Стиль: {safe_value(data, 'style')}
 
-Камера и параметры: {safe_value(camera, "camera_type")}, {safe_value(camera, "lens")}, {safe_value(camera, "aperture")}, {safe_value(camera, "shutter_speed")}, ISO {safe_value(camera, "iso")}, глубина резкости: {safe_value(camera, "depth_of_field")}
+Камера и параметры: {camera_text}
+{safe_value(composition, 'framing')}. {shot_text}
 
-{safe_value(composition, "shot_type")}, {safe_value(composition, "aspect_ratio")} кадр, {safe_value(composition, "camera_angle")}. {safe_value(subject, "description")} Положение в кадре: {safe_value(subject, "position")}. Перспектива: {safe_value(composition, "perspective")}.
+Причёска, кожа и макияж: {hairstyle_text}
 
-Причёска, кожа и макияж: волосы {safe_value(hair, "color")}, {safe_value(hair, "length")}, укладка {safe_value(hair, "style")}. Детали волос: {safe_value(hair, "details")}. Кожа: {safe_value(face, "skin")}. Макияж: {safe_value(face, "makeup")}.
+Образ: {outfit_text}
 
-Образ: {safe_value(outfit, "description")}. Цвета: {safe_value(outfit, "colors")}. Материалы и фактуры: {safe_value(outfit, "materials")}. Обувь: {safe_value(outfit, "shoes")}. Аксессуары: {safe_value(outfit, "accessories")}.
+Поза: {pose_text}
 
-Поза: корпус — {safe_value(pose, "body")}; голова — {safe_value(pose, "head")}; левая рука — {safe_value(pose, "left_arm")}; правая рука — {safe_value(pose, "right_arm")}; левая кисть — {safe_value(pose, "left_hand")}; правая кисть — {safe_value(pose, "right_hand")}; ноги — {safe_value(pose, "legs")}; стопы — {safe_value(pose, "feet")}.
+Освещение: {lighting_text}
 
-Освещение: {safe_value(lighting, "type")}. Источник: {safe_value(lighting, "source")}. Направление: {safe_value(lighting, "direction")}. Жёсткость: {safe_value(lighting, "hardness")}. Тени: {safe_value(lighting, "shadows")}. Контровой свет: {safe_value(lighting, "rim_light")}.
+Фон: {background_text}
 
-Фон: локация — {safe_value(environment, "location")}; фон — {safe_value(environment, "background")}; передний план — {safe_value(environment, "foreground")}; предметы — {safe_value(environment, "objects")}.
+Цветокор: {color_text}
 
-Цветокор: палитра — {safe_value(color, "palette")}; грейдинг — {safe_value(color, "grading")}; контраст — {safe_value(color, "contrast")}; насыщенность — {safe_value(color, "saturation")}; баланс белого — {safe_value(color, "white_balance")}.
+{text_block}Сохраняй композицию, геометрию, ракурс, кадрирование, положение и масштаб объектов, позу, освещение, фон и цветовую логику референса.
 
-Текст на изображении: наличие — {safe_value(text_info, "present")}; язык — {safe_value(text_info, "language")}; содержание — {safe_value(text_info, "content")}; положение — {safe_value(text_info, "position")}; стиль — {safe_value(text_info, "style")}.
-
-Сохрани оригинальную композицию, геометрию, ракурс, кадрирование, расположение и масштаб объектов, позу, освещение, фон и цветовую логику референса.
-
-Не добавляй элементы, которых нет в референсе.
-Не удаляй важные элементы референса.
-
-Качество и реализм:
-Максимальный фотореализм. Высокая детализация. Естественная анатомия. Реалистичная кожа. Натуральная текстура кожи. Реалистичные волосы. Реалистичные глаза. Естественный свет. Реалистичные тени.
-
-Негативный промпт:
-Без CGI. Без мультяшности. Без пластиковой кожи. Без деформаций. Без лишних пальцев. Без лишних конечностей. Без анатомических ошибок."""
+Максимальный фотореализм. Высокая детализация. Естественная анатомия. Реалистичная кожа. Натуральная текстура кожи. Реалистичные волосы. Реалистичные глаза. Естественный свет. Реалистичные тени. Без CGI. Без мультяшности. Без пластиковой кожи. Без деформаций. Без лишних пальцев. Без лишних конечностей. Без анатомических ошибок."""
 
     return prompt.strip()
 
@@ -627,8 +714,8 @@ def send_final_result(message, analysis_json, standard_prompt):
         "🎉 ГОТОВО!\n\n"
         f"✨ {title}\n\n"
         "Ниже всё подготовлено для ручной публикации в VK.\n"
-        "Фото оставляешь исходное, текст поста копируешь из блока №2,\n"
-        "промпт — из блока №4."
+        "Фото оставляешь исходное, текст поста копируешь из БЛОКА 1,\n"
+        "промпт — из БЛОКА 3."
     )
 
     # 2. Пост VK
