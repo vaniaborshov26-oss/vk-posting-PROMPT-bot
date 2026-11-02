@@ -60,10 +60,15 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    oauth_scopes, required_scopes = scope_list("VK_OAUTH_SCOPES"), scope_list("VK_REQUIRED_SCOPES")
+    if not oauth_scopes or not required_scopes:
+        raise RuntimeError("Задайте VK_OAUTH_SCOPES и VK_REQUIRED_SCOPES до запуска OAuth")
+    if not set(required_scopes).issubset(oauth_scopes):
+        raise RuntimeError("VK_REQUIRED_SCOPES должен быть подмножеством VK_OAUTH_SCOPES")
     return Settings(
         required("TELEGRAM_BOT_TOKEN"), int(required("TELEGRAM_CHAT_ID")), required("GEMINI_API_KEY"), required("YANDEX_TOKEN"), os.getenv("YANDEX_FOLDER", "disk:/Нейрофото"),
         os.getenv("VK_CLIENT_ID", "54775563"), required("VK_REDIRECT_URI"), int(required("VK_GROUP_ID")), os.getenv("VK_COMMUNITY_TOKEN", os.getenv("VK_ACCESS_TOKEN", "")),
-        scope_list("VK_OAUTH_SCOPES"), scope_list("VK_REQUIRED_SCOPES"), env_bool("VK_APP_CONFIDENTIAL"), os.getenv("VK_SERVICE_TOKEN", ""),
+        oauth_scopes, required_scopes, env_bool("VK_APP_CONFIDENTIAL"), os.getenv("VK_SERVICE_TOKEN", ""),
         os.getenv("VK_API_VERSION", "5.199"), float(os.getenv("POST_INTERVAL_HOURS", "2")), env_bool("SCHEDULER_ENABLED"), env_bool("RUN_ON_START"),
         Path(os.getenv("DATA_DIR", "/app/data")), int(os.getenv("PORT", "8080")), os.getenv("TEXT_MODEL", "gemini-3.6-flash"), int(os.getenv("REQUEST_TIMEOUT", "90")), int(os.getenv("MAX_YANDEX_FILE_BYTES", "26214400")),
     )
