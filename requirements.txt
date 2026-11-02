@@ -1,3 +1,6 @@
 pyTelegramBotAPI
 Pillow
 google-genai
+Flask
+requests
+
